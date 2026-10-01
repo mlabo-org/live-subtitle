@@ -8,6 +8,7 @@
 - Mac の全システム音声を取得し、whisper.cpp で書き起こし、日本語字幕にする Rust と `eframe/egui` の macOS GUI アプリ。
 - このリポジトリのソースが正本。`~/Applications/Live Subtitle.app` は実行用の生成物で、ソースと同一視しない。ソースを動かしても、インストール済みアプリが更新されたことにはならない。
 - `src/app_shell_foundation.rs` と `.app-shell-foundation/` は app-shell-foundation スキルの管理下にある。編集しない（更新はスキルの `apply` で行う）。
+- README は `README.md`（英語）と `README.ja.md`（日本語）の 2 つを、同じ内容で保つ。片方を変えたら、もう片方も変える。ライセンスは MIT（`LICENSE`、`Cargo.toml` の `license`）。
 
 ## Path Contract
 

@@ -2,6 +2,7 @@
 name = "live-subtitle"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Captures all system audio on macOS, transcribes it with whisper.cpp and shows Japanese subtitles"
 
 [dependencies]

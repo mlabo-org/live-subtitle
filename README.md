@@ -1,29 +1,33 @@
 # Live Subtitle
 
-Mac で鳴っているすべての音声（YouTube・X・会議など、アプリを問わず）を聞き取り、日本語字幕にする macOS 用 GUI ツール（Rust / eframe・egui）。
+English | [日本語](README.ja.md) · [MIT License](LICENSE)
+
+A macOS GUI tool (Rust, eframe/egui) that listens to everything your Mac plays (YouTube, X, meetings — any app) and shows it as Japanese subtitles.
 
 ```
-システム音声 ─ ScreenCaptureKit ─ 自動音量補正 ─ 発話の区切り検出 ─ whisper.cpp (Metal) ─ 翻訳 ─ 字幕
-                 16 kHz mono       (AGC)          相対しきい値      言語自動判定      Ollama / Claude / Codex
+system audio ─ ScreenCaptureKit ─ auto gain ─ utterance ─ whisper.cpp (Metal) ─ translation ─ subtitles
+                 16 kHz mono        (AGC)      splitting    language auto-detect   Ollama / Claude / Codex
+                                              (relative
+                                               threshold)
 ```
 
-- 原文はすぐ表示し、日本語訳は完成し次第あとから差し込む（翻訳が遅くても字幕は止まらない）。
-- 日本語の発話は翻訳せずそのまま出す。
-- 画面上部に入力音声のメーターを出す（緑、大きいと黄色、無音は灰色で「無音」）。表示は自動音量補正のあとの音量で、バーに乗せると補正量（dB）が出る。
-- 「会話履歴を保存」を押したときだけ、いまの字幕（原文・訳・時刻）を日時つきのテキストファイルに保存して、Finder で表示する（既定では何も保存しない）。保存先は既定でデスクトップ（ファイル名は `Live Subtitle 日付 時刻.txt`）。「保存先を選ぶ…」で任意のフォルダに変えられ、選んだ場所は次回も覚えている（「デスクトップに戻す」で既定に戻る）。初回は、そのフォルダへのアクセス許可を求められることがある。
-- モデル読み込み中（whisper・Ollama）は「…モデル読み込み中」と表示する。
-- ウィンドウは既定で最前面に固定（トグルで切り替え）。
-- 「帯にする」で、字幕だけの軽量表示（テロップ）になる。タイトルバーのない半透明の帯で、**帯にする直前のウィンドウと同じ中心に、同じ横幅で**出る（動画の幅に合わせたいときは、先に通常ウィンドウの幅を合わせておく）。前回の位置は使わない（見失うため）。出てから約 10 秒は、枠が黄色く点滅して見つけやすい。ドラッグで好きな位置へ動かし、端でサイズを変えられる（字幕の文字は帯の高さに合わせて大きくなり、高さだけ次回も覚えている）。しばらく発話が無いと消え、全画面表示の動画の上にも重なる。**ESC**（または帯に出る「元に戻す」ボタン）で、元のサイズと位置の通常画面に戻る。ESC は帯にフォーカスがあるときだけ効く（帯をクリックするとフォーカスされる）。
+- The original text appears immediately; the Japanese translation is filled in as soon as it is ready, so a slow translation never stalls the subtitles.
+- Japanese speech is shown as is, without translation.
+- An input level meter sits at the top of the window (green; yellow when loud; gray with "無音" when silent). It shows the level after automatic gain control; hover the bar to see the applied gain (dB).
+- Press "会話履歴を保存" (save conversation) to write the current subtitles (original, translation, time) to a timestamped text file and reveal it in Finder. Nothing is saved unless you press it. The default folder is the Desktop (file name `Live Subtitle <date> <time>.txt`); "保存先を選ぶ…" (choose folder) lets you pick any folder, and the choice is remembered ("デスクトップに戻す" returns to the default). macOS may ask for access to that folder the first time.
+- While models load (whisper, Ollama), the window shows a "…モデル読み込み中" (loading model) message.
+- The window stays on top by default (toggle available).
+- "帯にする" (make a band) switches to a compact subtitle-only view, like a TV caption: a borderless, translucent strip that opens **centered on where the normal window was, and as wide as it was** (to match a video's width, resize the normal window first). The previous position is deliberately not reused, because a band that reappears at an old position gets lost. For the first 10 seconds its frame blinks yellow so you can find it. Drag it anywhere and drag its edges to resize it (the text scales with the band's height; only the height is remembered). It fades out when nothing is being said and floats over full-screen video as well. **Esc** (or the "元に戻す" restore button that appears on hover) returns to the normal window at its original size and position. Esc works only while the band has focus (click the band to focus it).
 
-## 事前に用意するもの
+## What to prepare in advance
 
-**ビルドに必要なもの**
+**To build**
 
-- Apple Silicon の Mac（macOS 13 以降）
-- Xcode（または Command Line Tools）。Swift が要る（ScreenCaptureKit の橋渡し部分のビルドに使う）
-- Rust と cmake（`brew install cmake`。whisper.cpp のビルドに使う）
+- An Apple Silicon Mac (macOS 13 or later)
+- Xcode (or the Command Line Tools) — Swift is needed to build the ScreenCaptureKit bridge
+- Rust and cmake (`brew install cmake`; used to build whisper.cpp)
 
-**音声認識（必須）: whisper のモデル 1 個（約 574 MB）**
+**Speech recognition (required): one whisper model (about 574 MB)**
 
 ```bash
 mkdir -p ~/"Library/Application Support/LiveSubtitle"
@@ -31,123 +35,125 @@ curl -L -o ~/"Library/Application Support/LiveSubtitle/ggml-large-v3-turbo-q5_0.
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
 ```
 
-別の場所に置くときは、`LIVE_SUBTITLE_MODEL` でパスを指定する。
+To keep the model elsewhere, set `LIVE_SUBTITLE_MODEL` to its path.
 
-**翻訳先（1 つ以上。「翻訳しない」で使うなら不要）**
+**Translation backend (at least one; not needed if you use "翻訳しない" / no translation)**
 
-- **Ollama（おすすめ。無料でオフライン）**: Ollama を入れて起動しておき、モデルを取得する。
+- **Ollama (recommended; free and offline)**: install and start Ollama, then pull a model.
   ```bash
   ollama pull gemma4:26b-mlx
   ```
-  モデル名は、お使いの Ollama で取得できるものを選ぶ（画面のメニューに、入っているモデルが並ぶ）。大きなモデルは、メモリを大量に使う（下の「おすすめの翻訳モデル」と「Ollama のメモリ解放」を参照）。
-- **Claude**: Claude Code の `claude` コマンド（`~/.local/bin` など。別の場所は `LIVE_SUBTITLE_CLAUDE`）。サインインが要る（画面のボタンから始められる）。
-- **Codex**: `codex` コマンド（別の場所は `LIVE_SUBTITLE_CODEX`）。ChatGPT アカウントでのサインインが要る（画面のボタンから始められる）。
+  Choose a model your Ollama can pull (the window's menu lists the installed ones). Large models use a lot of memory — see "Recommended translation model" and "Releasing Ollama's memory" below.
+- **Claude**: the `claude` command of Claude Code (for example in `~/.local/bin`; set `LIVE_SUBTITLE_CLAUDE` for another location). Sign-in is required (the button in the window can start it).
+- **Codex**: the `codex` command (set `LIVE_SUBTITLE_CODEX` for another location). Signing in with a ChatGPT account is required (the button in the window can start it).
 
-Claude と Codex は、サインインしていなければ、画面の「サインイン」ボタンから公式のブラウザ認証（OAuth）を始められる。アプリは認証情報を扱わず、状態の確認と、公式の手順の開始だけを行う（Claude は `claude auth`、Codex は App Server の `account/*`）。
+If Claude or Codex is not signed in, the "サインイン" (sign in) button in the window starts the official browser OAuth flow. The app never handles credentials: it only checks the status and starts the official procedure (`claude auth` for Claude; the App Server's `account/*` methods for Codex).
 
-**署名 ID（推奨）**: ビルドし直しても画面収録の許可が外れないように、固定の署名 ID を用意する（下の「ビルドと起動」を参照）。
+**Signing identity (recommended)**: use a fixed code-signing identity so the Screen Recording permission survives rebuilds (see "Build and run" below).
 
-## おすすめの翻訳モデル
+## Recommended translation model
 
-**Ollama の `gemma4:26b-mlx`** が、使用感として快適（作者の感想）。測った値は次のとおり。
+**Ollama's `gemma4:26b-mlx`** feels comfortable in use (the author's impression). Measured values:
 
-| 項目 | 値 |
+| Item | Value |
 |---|---|
-| 1 文あたりの翻訳 | 約 0.65〜2 秒（2 回目以降。初回の読み込みだけ約 13 秒） |
-| ディスク | 約 18 GB |
-| メモリ（載っているとき） | 約 25.7 GB |
+| Translation per sentence | about 0.65–2 s (after the first; only the first load takes about 13 s) |
+| Disk | about 18 GB |
+| Memory (while loaded) | about 25.7 GB |
 
-ほかに、`gpt-oss:20b`（ディスク 13 GB、メモリ約 13.7 GB）と `qwen3.8:27b-mlx`（ディスク 18 GB、メモリ約 20.0 GB）も、画面のメニューから選べることを確認した（速度は未計測）。複数のモデルを同時にメモリへ載せると、50 GB を超えることがある。
+`gpt-oss:20b` (13 GB on disk, about 13.7 GB in memory) and `qwen3.8:27b-mlx` (18 GB on disk, about 20.0 GB in memory) were also confirmed to be selectable from the window's menu (their speed was not measured). Loading several models at once can exceed 50 GB.
 
-## 動作確認した環境
+## Verified environment
 
-macOS 27.0.1／Apple M1 Max（メモリ 64 GB）／Ollama 0.35.0／Claude Code 2.1.286／codex-cli 0.159.0／Rust 1.95.0／cmake 4.4.3／Swift 6.4
+macOS 27.0.1 / Apple M1 Max (64 GB) / Ollama 0.35.0 / Claude Code 2.1.286 / codex-cli 0.159.0 / Rust 1.95.0 / cmake 4.4.3 / Swift 6.4
 
-## ビルドと起動
+## Build and run
 
 ```bash
-CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Applications/Live Subtitle.app
+CODESIGN_IDENTITY="<signing identity>" scripts/bundle.sh   # default output: ~/Applications/Live Subtitle.app
 ```
 
-ビルドは一時ディレクトリで行う（iCloud 同期下だと codesign が失敗するため）。
-`CODESIGN_IDENTITY` を省くと ad-hoc 署名になり、**ビルドし直すたびに画面収録の許可が外れる**。固定の署名 ID を使うこと。
+The build happens in a temporary directory (codesign fails under iCloud-synced folders). Without `CODESIGN_IDENTITY` the app gets an ad-hoc signature and **the Screen Recording permission is lost on every rebuild**, so use a fixed identity.
 
-初回は、システム設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音 で `Live Subtitle.app` を許可する。
-署名を変えたあとに許可しているのに拒否される場合は、一覧から項目を「−」で削除して登録し直す。
+On first launch, allow `Live Subtitle.app` in System Settings → Privacy & Security → Screen & System Audio Recording. If access is still denied after you changed the signature, remove the entry from the list with "−" and add it again.
 
-## 翻訳先
+## Translation backends
 
-| 選択 | 実測の遅延 | 備考 |
+| Choice | Measured latency | Notes |
 |---|---|---|
-| Ollama（既定 `gemma4:26b-mlx`） | 約 0.7〜2 秒（初回の読み込みだけ約 13 秒。起動時に先読みする） | ローカル・オフライン |
-| Claude（常駐した `claude -p`） | 約 0.7〜2 秒（モデル次第。初回の起動だけ約 6 秒で、その間は「翻訳モデル読み込み中」と出る） | 高品質。プラン枠を使う。モデルは版を明示した ID（Haiku 4.5・Sonnet 5.5・Opus 5.5・Fable 5.1）から選ぶか、ID を手入力する |
-| Codex（常駐した `codex app-server`） | 約 2〜5 秒（ばらつきが大きい。初回の起動だけ約 5 秒） | ローカル Codex にサインイン済みの ChatGPT アカウントを使う。モデルは `model/list`（アカウントで使える一覧。既定は GPT-6.1-Sol）から選び、考える強さも選べる |
-| 翻訳しない | — | 原文のみ |
+| Ollama (default `gemma4:26b-mlx`) | about 0.7–2 s (only the first load takes about 13 s; it is preloaded at start) | local, offline |
+| Claude (a resident `claude -p`) | about 0.7–2 s depending on the model (only the first start takes about 6 s, during which "翻訳モデル読み込み中" is shown) | high quality; uses your plan's quota. Pick an explicit model version (Haiku 4.5, Sonnet 5.5, Opus 5.5, Fable 5.1) or type a model ID |
+| Codex (a resident `codex app-server`) | about 2–5 s (varies a lot; only the first start takes about 5 s) | uses the ChatGPT account the local Codex is signed in to. Models come from `model/list` (what your account can use; the default is GPT-6.1-Sol), and the reasoning effort is selectable |
+| No translation | — | original text only |
 
-## 翻訳先ごとの仕組み（どう接続しているか）
+## How each backend is connected
 
-アプリは、API キーを使わない。Claude と Codex は、お使いの PC に入っている公式のコマンドを、アプリが子プロセスとして起動して使う（ログインは、そのコマンドが持っているものをそのまま使う）。
+The app uses no API keys. For Claude and Codex it starts the official commands already installed on your Mac as child processes (the login is whatever those commands already hold).
 
-| 翻訳先 | 接続方法 |
+| Backend | Connection |
 |---|---|
-| **Claude** | **`claude` コマンド（CLI）を起動**する。`claude -p` を標準入出力の stream-json 形式で 1 つ起動したままにして、字幕 1 行を 1 メッセージとして流し込む。考える処理（thinking）・ツール・フック・設定の読み込み・セッション保存は、すべて切ってある。履歴が積み上がるので、40 行ごとに新しいプロセスへ切り替える（次のプロセスは、裏で先に起動しておく）。 |
-| **Codex** | **`codex app-server`（App Server）を起動**して、標準入出力の JSON-RPC で話す。サーバーは 1 つで、その上に使い捨て（ephemeral）のスレッドを 6 本立てて、字幕を並列に翻訳する（`thread/start` → 字幕ごとに `turn/start` → `item/agentMessage/delta` と `turn/completed` を受け取る）。承認は `never`、sandbox は `read-only`。モデルの一覧は `model/list`、サインインの確認と開始は `account/read`・`account/login/start`。 |
-| **Ollama** | **HTTP の API** で話す（既定は `http://127.0.0.1:11434`。`OLLAMA_HOST` で変えられる）。翻訳は `POST /api/chat`（ストリームなし・考える処理なし・`keep_alive` 30 分）、モデル一覧は `/api/tags`、メモリ解放は `/api/ps` と `/api/generate`。 |
+| **Claude** | **Starts the `claude` command (CLI).** One `claude -p` process runs in stream-json mode over stdin/stdout, and each subtitle line is one message to it. Thinking, tools, hooks, settings loading and session persistence are all turned off. The history grows with every message, so the process is replaced every 40 lines (the next one is started in the background beforehand). |
+| **Codex** | **Starts `codex app-server` (the App Server)** and talks JSON-RPC over stdin/stdout. One server hosts six ephemeral threads, so lines are translated in parallel (`thread/start`, then `turn/start` per line, then it reads `item/agentMessage/delta` and `turn/completed`). Approval policy is `never` and the sandbox is `read-only`. The model list comes from `model/list`; sign-in status and start use `account/read` and `account/login/start`. |
+| **Ollama** | **HTTP API** (default `http://127.0.0.1:11434`, changeable with `OLLAMA_HOST`). Translation is `POST /api/chat` (no streaming, no thinking, `keep_alive` 30 min); the model list is `/api/tags`; memory release uses `/api/ps` and `/api/generate`. |
 
-Claude と Codex のプロセスは、「停止」を押したときと、アプリの終了時に止める。
+The Claude and Codex processes are stopped when you press "停止" (stop) and when the app quits.
 
-## Ollama のメモリ解放
+## Releasing Ollama's memory
 
-大きなモデルは、メモリを数十 GB 使う。Taceta の「全モデル解放」と同じ方法（`/api/ps` で載っているモデルを調べ、各モデルに `keep_alive: 0` を送り、メモリから消えるまで待つ）で、次のときに解放する。**他のアプリが読み込んだモデルも対象**になる（次に使われたとき、再読み込みされる）。
+A large model uses tens of GB of memory. The app frees it the same way Taceta's "release all models" does (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them).
 
-- 画面の「メモリ解放」ボタンを押したとき
-- アプリの起動時（異常終了の取りこぼしを片付ける）
-- アプリの終了時
-- Ollama のモデルを切り替えたとき、または翻訳先を Ollama から別のものに変えたとき（新しいモデルは、解放が終わってから読み込む）
-- アプリがパニックしたとき、または SIGTERM／SIGINT／SIGHUP で終了させられたとき
+- When you press the "メモリ解放" (release memory) button
+- When the app starts (to clear what an abnormal exit left behind)
+- When the app quits
+- When you switch the Ollama model, or switch the engine away from Ollama (the new model is loaded only after the memory is free)
+- When the app panics, or is terminated by SIGTERM / SIGINT / SIGHUP
 
-Ollama が起動していなければ、起動はしない（載っているモデルはないものとして扱う）。強制終了などで、解放する機会がなかった場合は、次の起動時に片付く。それまでも、翻訳のリクエストに付けた `keep_alive`（30 分）を過ぎれば、Ollama が自分で解放する。
+If Ollama is not running, the app does not start it (nothing is considered loaded). If the app was killed without a chance to release, the models are cleared at the next launch; until then, Ollama frees them itself once the `keep_alive` (30 minutes) set on the translation requests runs out.
 
-**実機で確かめた結果**
+**Verified by hand**
 
-- 起動時: 起動の前に載っていた `gemma4:26b-mlx`（25.7 GB）と `qwen3.8:27b-mlx`（20.0 GB）が、起動直後に両方解放された（画面に「起動時: Ollama のモデルを 2 個、メモリから解放した」と出る）。
-- 終了時: `gpt-oss:20b`（13.7 GB）を載せてからアプリを終了すると、解放された。
-- 終了の合図（SIGTERM）: 同じく解放されてから、アプリが終了した。
-- 疑似の Ollama サーバーを使った単体テスト: 複数モデルの解放、何も載っていない場合、解放できないモデルの理由の表示、Ollama が動いていない場合。
-- 「メモリ解放」ボタンの押下と、モデル切り替え時の解放は、画面の操作が必要なので、自動の確認はしていない。
+- At launch: `gemma4:26b-mlx` (25.7 GB) and `qwen3.8:27b-mlx` (20.0 GB), which were loaded before launch, were both freed right after launch (the window shows "起動時: Ollama のモデルを 2 個、メモリから解放した").
+- At exit: after loading `gpt-oss:20b` (13.7 GB), quitting the app freed it.
+- On SIGTERM: likewise freed before the app exited.
+- Unit tests against a fake Ollama server: freeing several models, nothing loaded, a model that cannot be freed (its error text is shown), and Ollama not running.
+- Pressing the "メモリ解放" button and the release on model switch need UI interaction and were not checked automatically.
 
-**対象外**
+**Out of scope**
 
-- Claude と Codex の子プロセスは、この機能の対象ではない。「停止」とアプリ終了のときに、別に止める。
-- Ollama 以外（whisper のモデルなど）のメモリは、解放しない。
+- The Claude and Codex child processes are not part of this feature; they are stopped separately on "停止" and at exit.
+- Memory of anything other than Ollama (such as the whisper model) is not released.
 
-## 環境変数
+## Environment variables
 
-| 名前 | 用途 |
+| Name | Purpose |
 |---|---|
-| `LIVE_SUBTITLE_MODEL` | whisper モデルのパス |
-| `LIVE_SUBTITLE_CLAUDE` | `claude` コマンドのパス |
-| `LIVE_SUBTITLE_CODEX` | `codex` コマンドのパス |
-| `OLLAMA_HOST` | Ollama の接続先 |
-| `LIVE_SUBTITLE_AUTOSTART` | 設定すると起動と同時に聞き取りを始める |
-| `LIVE_SUBTITLE_HISTORY_DIR` | 「会話履歴を保存」の保存先（画面で選んだ場所があれば、そちらが優先） |
-| `LIVE_SUBTITLE_AUTOBAND` | 設定すると起動と同時に帯（テロップ）表示にする |
-| `LIVE_SUBTITLE_DEBUG_LOG` | 設定したパスに、入力レベル・区切り・認識・翻訳時間を追記する |
+| `LIVE_SUBTITLE_MODEL` | path of the whisper model |
+| `LIVE_SUBTITLE_CLAUDE` | path of the `claude` command |
+| `LIVE_SUBTITLE_CODEX` | path of the `codex` command |
+| `OLLAMA_HOST` | where Ollama listens |
+| `LIVE_SUBTITLE_AUTOSTART` | when set, start listening as soon as the app starts |
+| `LIVE_SUBTITLE_HISTORY_DIR` | folder for "会話履歴を保存" (a folder chosen in the window takes precedence) |
+| `LIVE_SUBTITLE_AUTOBAND` | when set, start in band (caption) mode |
+| `LIVE_SUBTITLE_DEBUG_LOG` | append input level, segmentation, recognition and translation timings to this path |
 
-## 構成
+## Layout
 
-- `src/capture.rs` システム音声の取得（ScreenCaptureKit、自アプリの音は除外）
-- `src/agc.rs` 自動音量補正（速く立ち上がり、ゆっくり戻る包絡線）
-- `src/history.rs` 会話履歴のファイル保存（ボタンを押したときだけ）
-- `src/pipeline.rs` 区切り検出（相対しきい値・最大 10 秒で強制分割）、whisper、翻訳スレッド
-- `src/translate.rs` 翻訳先の切り替えと Ollama
-- `src/claude.rs` 常駐した Claude CLI での翻訳
-- `src/codex.rs` 常駐した Codex App Server での翻訳
+- `src/capture.rs` system audio capture (ScreenCaptureKit; the app's own sound is excluded)
+- `src/agc.rs` automatic gain control (fast attack, slow release envelope)
+- `src/history.rs` saving the conversation to a file (only when the button is pressed)
+- `src/pipeline.rs` utterance splitting (relative threshold, forced split at 10 s), whisper, translation threads
+- `src/translate.rs` backend switching and Ollama
+- `src/claude.rs` translation through a resident Claude CLI
+- `src/codex.rs` translation through a resident Codex App Server
 - `src/main.rs` GUI
-- `src/app_shell_foundation.rs` 表示設定の共通部品（app-shell-foundation が管理。編集しない）
-- `examples/capture-spike.rs` 音声取得だけの動作確認
+- `src/app_shell_foundation.rs` shared display-settings component (managed by app-shell-foundation; do not edit)
+- `examples/capture-spike.rs` an audio-capture-only smoke test
 
-## 既知の制約
+## Known limitations
 
-- このMacでは、取得した音声の音量がかなり小さい（RMS 約 0.005）。原因は未特定。自動音量補正（AGC。目標は約 -20 dBFS、最大 +36 dB、無音の間はゲインを固定）で持ち上げて whisper に渡す。区切り検出は、補正前の信号に対する相対しきい値で行う。
-- 音楽や環境音しかない区間でも、10 秒ごとに whisper へ渡す。幻聴（存在しない発話の出力）は、無音確率と記号だけの結果の除外で抑えているが、完全ではない。
+- On this Mac the captured audio is quite quiet (RMS about 0.005); the cause is unknown. Automatic gain control (AGC: target about -20 dBFS, at most +36 dB, gain held during silence) lifts it before whisper. Utterance splitting uses a threshold relative to the signal before the gain.
+- Music or ambient sound alone is still handed to whisper every 10 seconds. Hallucinated speech is suppressed by the no-speech probability and by dropping symbol-only results, but not perfectly.
+
+## License
+
+[MIT](LICENSE)
