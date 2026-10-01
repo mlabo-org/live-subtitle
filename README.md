@@ -82,11 +82,11 @@ For the permissions macOS asks for, see "macOS permissions" below.
 | Permission | Needed? | When | What it is |
 |---|---|---|---|
 | **Screen & System Audio Recording** | **Required** | the first time you press "開始" (start) | needed to capture system audio. The app does not use any screen image — it takes audio only |
-| Folder access (the Desktop, or the folder you chose) | only when saving a conversation | the first save | press Allow if macOS asks. If you denied it, choose another folder or allow it in System Settings → Privacy & Security → Files & Folders |
+| Folder access (the Desktop, or the folder you chose) | only when saving a conversation | the first save | allow it when macOS asks |
 | Microphone | not needed | — | the app does not use the microphone (it captures what your Mac plays) |
 | Accessibility / Input Monitoring | not needed | — | Esc is read only while the band has focus; there is no global key monitoring |
 
-As far as we checked, no permission beyond the table above was needed (Ollama is reached on `127.0.0.1`; Claude and Codex are just started as child processes). Depending on your setup, macOS may ask for something else.
+If macOS asks for anything else (folder access and the like), just read the prompt and allow it as needed.
 
 **Granting Screen & System Audio Recording**
 
