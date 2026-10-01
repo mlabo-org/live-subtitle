@@ -75,7 +75,44 @@ CODESIGN_IDENTITY="<signing identity>" scripts/bundle.sh   # default output: ~/A
 
 The build happens in a temporary directory (codesign fails under iCloud-synced folders). Without `CODESIGN_IDENTITY` the app gets an ad-hoc signature and **the Screen Recording permission is lost on every rebuild**, so use a fixed identity.
 
-On first launch, allow `Live Subtitle.app` in System Settings → Privacy & Security → Screen & System Audio Recording. If access is still denied after you changed the signature, remove the entry from the list with "−" and add it again.
+For the permissions macOS asks for, see "macOS permissions" below.
+
+## macOS permissions
+
+| Permission | Needed? | When | What it is |
+|---|---|---|---|
+| **Screen & System Audio Recording** | **Required** | the first time you press "開始" (start) | needed to capture system audio. The app does not use any screen image — it takes audio only |
+| Folder access (the Desktop, or the folder you chose) | only when saving a conversation | the first save | press Allow if macOS asks. If you denied it, choose another folder or allow it in System Settings → Privacy & Security → Files & Folders |
+| Microphone | not needed | — | the app does not use the microphone (it captures what your Mac plays) |
+| Accessibility / Input Monitoring | not needed | — | Esc is read only while the band has focus; there is no global key monitoring |
+
+As far as we checked, no permission beyond the table above was needed (Ollama is reached on `127.0.0.1`; Claude and Codex are just started as child processes). Depending on your setup, macOS may ask for something else.
+
+**Granting Screen & System Audio Recording**
+
+1. Launch `Live Subtitle.app` and press "開始". Without the permission a red message "画面収録の許可が必要: …" (screen recording permission required) appears (macOS may also show a dialog).
+2. Open System Settings → Privacy & Security → **Screen & System Audio Recording** and turn on `Live Subtitle`. If it is not listed, press "+" and add `~/Applications/Live Subtitle.app` (in the file picker, press `Cmd+Shift+G` and paste the path).
+3. Press "開始" again. If it is still denied, quit the app and launch it again.
+
+**Easy-to-miss points**
+
+- The permission is tied to the app's **code signature**. With an ad-hoc signature it is lost on every rebuild; use a fixed signing identity (see "Build and run").
+- After the signature changed, access can stay denied even though the toggle is on (a stale entry for the old signature remains). Remove that entry with "−" and register the app again.
+- Keep the app you authorize in a place that is easy to find in a file picker, such as `~/Applications`, not a hidden location like `/tmp`.
+
+## When something goes wrong (things actually hit during development)
+
+| Symptom | Cause and fix |
+|---|---|
+| The red "画面収録の許可が必要" message appears | Follow "Granting Screen & System Audio Recording" above. If it appears although the toggle is on, remove the entry with "−" and register it again |
+| Sound is playing but the meter stays at "無音" (silent) / no subtitles | Check the permission first. Also remember that the app's own sound is excluded from capture, and that a quiet source is lifted by the automatic gain control |
+| Subtitles lag | It depends on the backend and model: Ollama and Claude take about 1–2 s, Codex about 2–5 s. With Codex pick a lighter model such as Luna or Terra. A line that waits more than 10 s for a translator is shown untranslated |
+| The first subtitle after starting is slow | The model is loading (Ollama about 13 s, Claude about 6 s, Codex about 5 s). Wait while "…モデル読み込み中" is shown |
+| Your Mac uses 50 GB+ of memory | A large Ollama model is loaded. Press "メモリ解放" (it is also released automatically at start, at exit and on a model switch; what a forced kill left behind is cleared at the next launch) |
+| Your Mac's sound suddenly got loud while testing | The app never changes the Mac's output volume or the signal sent to your speakers; the automatic gain control touches only the captured copy. The loudness seen during development came from full-level test sounds (`say`, `afplay`), not from the app's gain |
+| You lost the band | For the first 10 seconds its frame blinks yellow. Click the band to focus it, then press Esc or the restore button to return to the normal window. Esc works only while the band has focus |
+| Claude sign-in does not finish | If the browser flow does not complete by itself, run `claude auth login` in a terminal (the Claude sign-in action itself was not verified on the author's Mac) |
+| `codesign` fails | It fails when the build happens inside an iCloud-synced folder such as `~/Desktop`. `scripts/bundle.sh` builds in a temporary directory, so build through the script |
 
 ## Translation backends
 
