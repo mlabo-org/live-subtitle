@@ -59,7 +59,7 @@ fn native_window(frame: &eframe::Frame) -> Option<Retained<NSWindow>> {
     view.window()
 }
 
-/// Applies the macOS window traits the band needs; `false` restores the ordinary window.
+/// Applies the macOS window traits the band needs; `false` makes it an ordinary opaque window again.
 pub fn configure_window(frame: &eframe::Frame, band: bool) {
     let Some(window) = native_window(frame) else {
         return;
@@ -73,7 +73,11 @@ pub fn configure_window(frame: &eframe::Frame, band: bool) {
         window.setOpaque(false);
         window.setBackgroundColor(Some(&NSColor::clearColor()));
     } else {
+        // The window is created transparent (the band needs that), so the ordinary window must be made opaque
+        // again or its title bar would show whatever is behind it.
         window.setCollectionBehavior(NSWindowCollectionBehavior::Default);
         window.setHasShadow(true);
+        window.setOpaque(true);
+        window.setBackgroundColor(None);
     }
 }

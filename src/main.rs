@@ -168,7 +168,8 @@ impl App {
             notice_tx,
             notice_rx,
             band: None,
-            band_configured: false,
+            // true on purpose: the first frame applies the ordinary (opaque) window traits.
+            band_configured: true,
             last_line_at: None,
             notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
