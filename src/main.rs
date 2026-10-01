@@ -28,6 +28,8 @@ const SETTINGS_STORAGE_KEY: &str = "live-subtitle.settings.v1";
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const MAX_LINES: usize = 5000;
 const BAND_VISIBLE_SECONDS: f64 = 10.0;
+const BAND_FIND_SECONDS: f32 = 10.0;
+const BAND_FIND_YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 214, 0);
 const NORMAL_MIN_SIZE: [f32; 2] = [380.0, 260.0];
 const BAND_MIN_SIZE: [f32; 2] = [240.0, 70.0];
 const METER_MIN_DB: f32 = -70.0;
@@ -42,9 +44,10 @@ struct Persisted {
     translate: TranslateSettings,
     always_on_top: bool,
     show_original: bool,
-    /// Last position and size of the band (x, y, width, height), restored the next time it opens.
+    /// Height of the band. Its position is deliberately not remembered: it opens where the normal window
+    /// was, because a band that reappears at an old position gets lost. Its width follows the normal window.
     #[serde(default)]
-    band_rect: Option<[f32; 4]>,
+    band_height: Option<f32>,
     /// Folder chosen for saved conversations; the Desktop when unset.
     #[serde(default)]
     history_dir: Option<std::path::PathBuf>,
@@ -52,7 +55,7 @@ struct Persisted {
 
 impl Default for Persisted {
     fn default() -> Self {
-        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_rect: None, history_dir: None }
+        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_height: None, history_dir: None }
     }
 }
 
@@ -88,6 +91,8 @@ struct BandState {
     restore_pos: egui::Pos2,
     restore_size: egui::Vec2,
     passthrough: bool,
+    /// When the band opened; its frame blinks for `BAND_FIND_SECONDS` so it can be found.
+    started: Instant,
 }
 
 struct App {
@@ -698,17 +703,23 @@ impl App {
         let (Some(outer), Some(inner)) = (outer, inner) else {
             return false;
         };
-        let (pos, size) = match self.persisted.band_rect {
-            Some([x, y, w, h]) => (egui::pos2(x, y), egui::vec2(w, h)),
-            None => {
-                // The display is measured in macOS points; egui's window coordinates are those divided by the UI zoom.
-                let zoom = ctx.zoom_factor();
-                let display = band::display_rect_containing(outer.center() * zoom);
-                let display = egui::Rect::from_min_max(display.min / zoom, display.max / zoom);
-                band::default_band(display, band::band_height(f32::from(self.preferences.font_size_points)))
-            }
-        };
-        self.band = Some(BandState { restore_pos: outer.min, restore_size: inner.size(), passthrough: false });
+        // The display is measured in macOS points; egui's window coordinates are those divided by the UI zoom.
+        let zoom = ctx.zoom_factor();
+        let display = band::display_rect_containing(outer.center() * zoom);
+        let display = egui::Rect::from_min_max(display.min / zoom, display.max / zoom);
+        let height = band::band_height(f32::from(self.preferences.font_size_points));
+        // The band is as wide as the normal window was (resize that window to match the video), and as tall as
+        // last time.
+        // A remembered height is capped so the band can never come up as a huge slab.
+        let size = egui::vec2(inner.width(), self.persisted.band_height.unwrap_or(height).min(display.height() * 0.25))
+            .min(display.size() - egui::vec2(16.0, 16.0));
+        let pos = band::centered_on(display, outer.center(), size);
+        self.band = Some(BandState {
+            restore_pos: outer.min,
+            restore_size: inner.size(),
+            passthrough: false,
+            started: Instant::now(),
+        });
         use egui::ViewportCommand as Cmd;
         for cmd in [
             Cmd::Decorations(false),
@@ -729,7 +740,7 @@ impl App {
             return;
         };
         if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-            self.persisted.band_rect = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
+            self.persisted.band_height = Some(rect.height());
         }
         use egui::ViewportCommand as Cmd;
         for cmd in [
@@ -757,11 +768,22 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         let alpha = ctx.animate_bool_with_time(egui::Id::new("band-visible"), visible, 0.25);
+        // Right after the band opens its frame blinks yellow, so it cannot be lost on a busy screen.
+        let age = self.band.as_ref().map_or(f32::MAX, |b| b.started.elapsed().as_secs_f32());
+        let finding = age < BAND_FIND_SECONDS;
+        let pulse = if finding {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            let fade_out = (BAND_FIND_SECONDS - age).clamp(0.0, 1.0);
+            (0.5 + 0.5 * (age * std::f32::consts::TAU * 1.5).sin()) * fade_out
+        } else {
+            0.0
+        };
         // While nothing is shown the strip lets mouse clicks through to the video underneath.
+        let interactive = visible || finding;
         if let Some(band) = &mut self.band {
-            if band.passthrough == visible {
-                band.passthrough = !visible;
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!visible));
+            if band.passthrough == interactive {
+                band.passthrough = !interactive;
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!interactive));
             }
         }
         let size = band::unit_for_height(ctx.content_rect().height());
@@ -776,10 +798,16 @@ impl App {
             .then(|| format!("[{}] {}", l.lang, l.original));
             (main, color, original)
         });
+        let content_is_none = content.is_none();
         let mut exit = false;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
             let rect = ui.max_rect();
-            ui.painter().rect_filled(rect, 14.0, egui::Color32::from_black_alpha((190.0 * alpha) as u8));
+            let fill = (190.0 * alpha).max(if finding { 90.0 } else { 0.0 });
+            ui.painter().rect_filled(rect, 14.0, egui::Color32::from_black_alpha(fill as u8));
+            if finding {
+                let stroke = egui::Stroke::new(5.0, BAND_FIND_YELLOW.gamma_multiply(0.3 + 0.7 * pulse));
+                ui.painter().rect_stroke(rect.shrink(2.5), 14.0, stroke, egui::StrokeKind::Inside);
+            }
             let drag = ui.interact(rect, egui::Id::new("band-drag"), egui::Sense::click_and_drag());
             if drag.drag_started() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -798,7 +826,16 @@ impl App {
                     }
                 });
             }
-            if alpha > 0.05 && ui.rect_contains_pointer(rect) {
+            if finding && content_is_none {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "字幕を待っています　ドラッグで移動・端でサイズ変更・ESC で元に戻る",
+                    egui::FontId::proportional((size * 0.9).max(12.0)),
+                    egui::Color32::WHITE.gamma_multiply(0.85),
+                );
+            }
+            if (alpha > 0.05 || finding) && ui.rect_contains_pointer(rect) {
                 let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 6.0), egui::vec2(144.0, 24.0));
                 if ui.put(button, egui::Button::new("元に戻す（ESC）").small()).clicked() {
                     exit = true;

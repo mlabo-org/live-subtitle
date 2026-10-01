@@ -31,14 +31,18 @@ pub fn band_height(font_size_points: f32) -> f32 {
     font_size_points * (1.9 * 2.7 + 1.7) + 36.0
 }
 
-/// First-time placement: 60% of the display width, centered, a little above the bottom edge.
-pub fn default_band(display: Rect, height: f32) -> (Pos2, Vec2) {
-    let size = Vec2::new(display.width() * 0.6, height);
-    let pos = Pos2::new(
-        display.min.x + (display.width() - size.x) / 2.0,
-        display.max.y - height - display.height() * 0.09,
-    );
-    (pos, size)
+/// The top-left corner of a window of `size` centered on `center`, kept inside `display`. The band opens
+/// where the normal window was, so it is never somewhere the user does not expect it.
+pub fn centered_on(display: Rect, center: Pos2, size: Vec2) -> Pos2 {
+    let margin = 8.0;
+    let place = |center: f32, size: f32, min: f32, max: f32| {
+        let lowest = min + margin;
+        (center - size / 2.0).clamp(lowest, (max - size - margin).max(lowest))
+    };
+    Pos2::new(
+        place(center.x, size.x, display.min.x, display.max.x),
+        place(center.y, size.y, display.min.y, display.max.y),
+    )
 }
 
 /// The font-size unit that makes the band's content fill a band of this height.
