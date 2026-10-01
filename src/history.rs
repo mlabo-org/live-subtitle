@@ -17,13 +17,25 @@ pub struct Record<'a> {
     pub note: Option<String>,
 }
 
-/// Where saved conversations go: `LIVE_SUBTITLE_HISTORY_DIR`, or the app's support folder.
-pub fn history_dir() -> PathBuf {
+/// Where saved conversations go: the folder the user chose, else `LIVE_SUBTITLE_HISTORY_DIR`, else the Desktop.
+pub fn history_dir(chosen: Option<&Path>) -> PathBuf {
+    if let Some(dir) = chosen {
+        return dir.to_path_buf();
+    }
     if let Some(dir) = std::env::var_os("LIVE_SUBTITLE_HISTORY_DIR") {
         return dir.into();
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join("Library/Application Support/LiveSubtitle/history")
+    home.join("Desktop")
+}
+
+/// The folder as shown to the user: the home directory is written as `~`.
+pub fn display_dir(dir: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    match dir.strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => dir.display().to_string(),
+    }
 }
 
 fn render(saved_at: DateTime<Local>, records: &[Record]) -> String {
@@ -44,7 +56,7 @@ fn render(saved_at: DateTime<Local>, records: &[Record]) -> String {
 pub fn save(dir: &Path, records: &[Record]) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let now = Local::now();
-    let path = dir.join(format!("{}.txt", now.format("%Y-%m-%d_%H-%M-%S")));
+    let path = dir.join(format!("Live Subtitle {}.txt", now.format("%Y-%m-%d %H-%M-%S")));
     let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)?;
     file.write_all(render(now, records).as_bytes())?;
     Ok(path)
@@ -79,5 +91,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("txt"));
         assert!(text.starts_with("# Live Subtitle ") && text.contains("Hello there.") && text.contains("やあ。"));
+    }
+
+    #[test]
+    fn a_chosen_folder_wins_and_home_is_shown_as_tilde() {
+        let chosen = Path::new("/somewhere/else");
+        assert_eq!(history_dir(Some(chosen)), chosen);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(display_dir(&home.join("Desktop")), "~/Desktop");
+        assert_eq!(display_dir(chosen), "/somewhere/else");
     }
 }

@@ -43,11 +43,14 @@ struct Persisted {
     /// Last position and size of the band (x, y, width, height), restored the next time it opens.
     #[serde(default)]
     band_rect: Option<[f32; 4]>,
+    /// Folder chosen for saved conversations; the Desktop when unset.
+    #[serde(default)]
+    history_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Persisted {
     fn default() -> Self {
-        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_rect: None }
+        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_rect: None, history_dir: None }
     }
 }
 
@@ -149,7 +152,7 @@ impl App {
                 history::Record { at: l.at, lang: &l.lang, original: &l.original, japanese, note }
             })
             .collect();
-        self.notice = Some(match history::save(&history::history_dir(), &records) {
+        self.notice = Some(match history::save(&history::history_dir(self.persisted.history_dir.as_deref()), &records) {
             Ok(path) => {
                 let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
                 format!("{} 件を保存しました: {}", records.len(), path.display())
@@ -300,6 +303,13 @@ impl App {
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
         }
+        ui.horizontal_wrapped(|ui| {
+            let dir = history::history_dir(self.persisted.history_dir.as_deref());
+            ui.colored_label(APP_SHELL_WEAK_TEXT, format!("履歴の保存先: {}", history::display_dir(&dir)));
+            if self.persisted.history_dir.is_some() && ui.small_button("デスクトップに戻す").clicked() {
+                self.persisted.history_dir = None;
+            }
+        });
         if let Some(notice) = &self.notice {
             ui.colored_label(APP_SHELL_WEAK_TEXT, notice);
         }
@@ -371,6 +381,12 @@ impl App {
                 .clicked()
             {
                 self.save_conversation();
+            }
+            if ui.button("保存先を選ぶ…").on_hover_text("会話履歴を保存するフォルダを選ぶ（既定はデスクトップ）").clicked() {
+                let start = history::history_dir(self.persisted.history_dir.as_deref());
+                if let Some(dir) = rfd::FileDialog::new().set_title("会話履歴の保存先").set_directory(start).pick_folder() {
+                    self.persisted.history_dir = Some(dir);
+                }
             }
             if ui
                 .button("帯にする")
