@@ -1,5 +1,6 @@
 //! capture → utterance segmentation → whisper → translation, each stage on its own thread.
 
+use crate::agc::Agc;
 use crate::capture::{Capture, SAMPLE_RATE};
 use crate::translate::{self, Engine, TranslateSettings};
 use std::collections::VecDeque;
@@ -22,7 +23,8 @@ pub enum Event {
     Asr(Stage),
     /// Translation model state (Ollama warm-up).
     Translator(Stage),
-    Level(f32),
+    /// RMS after automatic gain control, and the gain currently applied.
+    Level { rms: f32, gain_db: f32 },
     Heard { id: u64, lang: String, text: String },
     Translated { id: u64, text: String },
     TranslateFailed { id: u64, error: String },
@@ -113,8 +115,11 @@ const MAX_FRAMES: usize = 500; // 10 s hard cap so continuous audio still produc
 const CUT_WINDOW: usize = 150; // the cap cuts at the quietest frame within the last 3 s
 
 /// Energy-based utterance segmenter.
+///
+/// Voice activity is judged on the raw signal; the audio kept for whisper is the AGC-leveled twin.
 struct Segmenter {
     carry: Vec<f32>,
+    carry_leveled: Vec<f32>,
     frames: Vec<f32>,
     rms: Vec<f32>,
     in_speech: bool,
@@ -127,6 +132,7 @@ impl Segmenter {
     fn new() -> Self {
         Self {
             carry: Vec::new(),
+            carry_leveled: Vec::new(),
             frames: Vec::new(),
             rms: Vec::new(),
             in_speech: false,
@@ -151,12 +157,14 @@ impl Segmenter {
         self.silence = 0;
     }
 
-    fn push(&mut self, chunk: &[f32]) -> Vec<Vec<f32>> {
-        self.carry.extend_from_slice(chunk);
+    fn push(&mut self, raw: &[f32], leveled: &[f32]) -> Vec<Vec<f32>> {
+        self.carry.extend_from_slice(raw);
+        self.carry_leveled.extend_from_slice(leveled);
         let mut out = Vec::new();
         while self.carry.len() >= FRAME {
-            let frame: Vec<f32> = self.carry.drain(..FRAME).collect();
-            let e = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
+            let raw_frame: Vec<f32> = self.carry.drain(..FRAME).collect();
+            let frame: Vec<f32> = self.carry_leveled.drain(..FRAME).collect();
+            let e = (raw_frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
             let voiced = e > (self.floor * 2.5).max(MIN_VOICED_RMS);
             if !voiced {
                 self.floor = self.floor * 0.98 + e * 0.02;
@@ -214,18 +222,6 @@ fn debug_log(line: &str) {
     }
 }
 
-/// Lifts quiet utterances to a consistent level (whisper degrades on very low-amplitude input).
-fn normalize(mut samples: Vec<f32>) -> Vec<f32> {
-    let peak = samples.iter().fold(0f32, |p, s| p.max(s.abs()));
-    if peak > 1e-4 && peak < 0.3 {
-        let gain = (0.5 / peak).min(40.0);
-        for s in &mut samples {
-            *s *= gain;
-        }
-    }
-    samples
-}
-
 fn is_noise(text: &str) -> bool {
     text.chars().all(|c| !c.is_alphanumeric())
         || (text.starts_with('[') && text.ends_with(']'))
@@ -251,25 +247,31 @@ fn run_asr(
 
     let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
     let mut seg = Segmenter::new();
+    let mut agc = Agc::new();
     let mut next_id = 0u64;
     let mut last_text = String::new();
     let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
 
     while !stop.load(Ordering::Relaxed) {
-        let chunk = match rx.recv_timeout(Duration::from_millis(200)) {
+        let raw = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let level = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
-        let _ = tx.send(Event::Level(level));
+        let mut leveled = raw.clone();
+        let level = agc.process(&mut leveled);
+        let _ = tx.send(Event::Level { rms: level, gain_db: agc.gain_db() });
         chunks += 1;
         peak = peak.max(level);
         if tick.elapsed() >= Duration::from_secs(2) {
-            debug_log(&format!("chunks={chunks} peak_rms={peak:.4} {}", seg.debug()));
+            debug_log(&format!(
+                "chunks={chunks} leveled_peak_rms={peak:.4} agc_gain={:.1}dB {}",
+                agc.gain_db(),
+                seg.debug()
+            ));
             (chunks, peak, tick) = (0, 0.0, std::time::Instant::now());
         }
-        for utterance in seg.push(&chunk) {
+        for utterance in seg.push(&raw, &leveled) {
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some("auto"));
             params.set_translate(false);
@@ -281,7 +283,6 @@ fn run_asr(
             params.set_print_progress(false);
             params.set_print_realtime(false);
             params.set_print_timestamps(false);
-            let utterance = normalize(utterance);
             let t0 = std::time::Instant::now();
             let ok = state.full(params, &utterance).is_ok();
             debug_log(&format!(

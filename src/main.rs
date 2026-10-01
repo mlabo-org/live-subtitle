@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod app_shell_foundation;
+mod agc;
 mod capture;
 mod pipeline;
 mod translate;
@@ -64,6 +65,7 @@ struct App {
     asr: Stage,
     translator: Stage,
     level: f32,
+    gain_db: f32,
     error: Option<String>,
     ollama_models: Vec<String>,
 }
@@ -91,6 +93,7 @@ impl App {
             asr: Stage::Idle,
             translator: Stage::Idle,
             level: 0.0,
+            gain_db: 0.0,
             error: None,
             ollama_models: translate::ollama_models(),
         };
@@ -121,6 +124,7 @@ impl App {
         self.asr = Stage::Idle;
         self.translator = Stage::Idle;
         self.level = 0.0;
+        self.gain_db = 0.0;
     }
 
     fn drain_events(&mut self) {
@@ -131,7 +135,10 @@ impl App {
             match ev {
                 Event::Asr(s) => self.asr = s,
                 Event::Translator(s) => self.translator = s,
-                Event::Level(l) => self.level = l.max(self.level * 0.95),
+                Event::Level { rms, gain_db } => {
+                    self.level = rms.max(self.level * 0.95);
+                    self.gain_db = gain_db;
+                }
                 Event::Heard { id, lang, text } => {
                     let engine = self.persisted.translate.engine;
                     let japanese = if lang == "ja" || engine == Engine::Off {
@@ -225,7 +232,7 @@ impl App {
                 if silent {
                     bar = bar.text("無音");
                 }
-                ui.add(bar);
+                ui.add(bar).on_hover_text(format!("自動音量補正（AGC）: +{:.0} dB", self.gain_db));
             });
         }
         if let Some(e) = &self.error {
