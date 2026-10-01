@@ -4,7 +4,7 @@ Mac で鳴っているすべての音声（YouTube・X・会議など、アプ�
 
 ```
 システム音声 ─ ScreenCaptureKit ─ 自動音量補正 ─ 発話の区切り検出 ─ whisper.cpp (Metal) ─ 翻訳 ─ 字幕
-                 16 kHz mono       (AGC)          相対しきい値      言語自動判定            Ollama / Claude
+                 16 kHz mono       (AGC)          相対しきい値      言語自動判定      Ollama / Claude / Codex
 ```
 
 - 原文はすぐ表示し、日本語訳は完成し次第あとから差し込む（翻訳が遅くても字幕は止まらない）。
@@ -15,15 +15,53 @@ Mac で鳴っているすべての音声（YouTube・X・会議など、アプ�
 - ウィンドウは既定で最前面に固定（トグルで切り替え）。
 - 「帯にする」で、字幕だけの軽量表示（テロップ）になる。タイトルバーのない半透明の帯で、**帯にする直前のウィンドウと同じ中心に、同じ横幅で**出る（動画の幅に合わせたいときは、先に通常ウィンドウの幅を合わせておく）。前回の位置は使わない（見失うため）。出てから約 10 秒は、枠が黄色く点滅して見つけやすい。ドラッグで好きな位置へ動かし、端でサイズを変えられる（字幕の文字は帯の高さに合わせて大きくなり、高さだけ次回も覚えている）。しばらく発話が無いと消え、全画面表示の動画の上にも重なる。**ESC**（または帯に出る「元に戻す」ボタン）で、元のサイズと位置の通常画面に戻る。ESC は帯にフォーカスがあるときだけ効く（帯をクリックするとフォーカスされる）。
 
-## 必要なもの
+## 事前に用意するもの
 
-- macOS 13 以降、Apple Silicon、Rust、cmake
-- whisper のモデル `ggml-large-v3-turbo-q5_0.bin`（約 574 MB）を `~/Library/Application Support/LiveSubtitle/` に置く
-  （取得元: `https://huggingface.co/ggerganov/whisper.cpp`。別の場所は `LIVE_SUBTITLE_MODEL` で指定）
-- 翻訳に Ollama を使うなら、Ollama が動いていてモデルが入っていること
-- 翻訳に Claude を使うなら、`claude` コマンド（`~/.local/bin` など。別の場所は `LIVE_SUBTITLE_CLAUDE`）
-- 翻訳に Codex を使うなら、`codex` コマンド（別の場所は `LIVE_SUBTITLE_CODEX`）
-- Claude と Codex は、サインインしていなければ、画面の「サインイン」ボタンから公式のブラウザ認証（OAuth）を始められる。アプリは認証情報を扱わず、状態の確認と、公式の手順の開始だけを行う（Claude は `claude auth`、Codex は App Server の `account/*`）。
+**ビルドに必要なもの**
+
+- Apple Silicon の Mac（macOS 13 以降）
+- Xcode（または Command Line Tools）。Swift が要る（ScreenCaptureKit の橋渡し部分のビルドに使う）
+- Rust と cmake（`brew install cmake`。whisper.cpp のビルドに使う）
+
+**音声認識（必須）: whisper のモデル 1 個（約 574 MB）**
+
+```bash
+mkdir -p ~/"Library/Application Support/LiveSubtitle"
+curl -L -o ~/"Library/Application Support/LiveSubtitle/ggml-large-v3-turbo-q5_0.bin" \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+```
+
+別の場所に置くときは、`LIVE_SUBTITLE_MODEL` でパスを指定する。
+
+**翻訳先（1 つ以上。「翻訳しない」で使うなら不要）**
+
+- **Ollama（おすすめ。無料でオフライン）**: Ollama を入れて起動しておき、モデルを取得する。
+  ```bash
+  ollama pull gemma4:26b-mlx
+  ```
+  モデル名は、お使いの Ollama で取得できるものを選ぶ（画面のメニューに、入っているモデルが並ぶ）。大きなモデルは、メモリを大量に使う（下の「おすすめの翻訳モデル」と「Ollama のメモリ解放」を参照）。
+- **Claude**: Claude Code の `claude` コマンド（`~/.local/bin` など。別の場所は `LIVE_SUBTITLE_CLAUDE`）。サインインが要る（画面のボタンから始められる）。
+- **Codex**: `codex` コマンド（別の場所は `LIVE_SUBTITLE_CODEX`）。ChatGPT アカウントでのサインインが要る（画面のボタンから始められる）。
+
+Claude と Codex は、サインインしていなければ、画面の「サインイン」ボタンから公式のブラウザ認証（OAuth）を始められる。アプリは認証情報を扱わず、状態の確認と、公式の手順の開始だけを行う（Claude は `claude auth`、Codex は App Server の `account/*`）。
+
+**署名 ID（推奨）**: ビルドし直しても画面収録の許可が外れないように、固定の署名 ID を用意する（下の「ビルドと起動」を参照）。
+
+## おすすめの翻訳モデル
+
+**Ollama の `gemma4:26b-mlx`** が、使用感として快適（作者の感想）。測った値は次のとおり。
+
+| 項目 | 値 |
+|---|---|
+| 1 文あたりの翻訳 | 約 0.65〜2 秒（2 回目以降。初回の読み込みだけ約 13 秒） |
+| ディスク | 約 18 GB |
+| メモリ（載っているとき） | 約 25.7 GB |
+
+ほかに、`gpt-oss:20b`（ディスク 13 GB、メモリ約 13.7 GB）と `qwen3.8:27b-mlx`（ディスク 18 GB、メモリ約 20.0 GB）も、画面のメニューから選べることを確認した（速度は未計測）。複数のモデルを同時にメモリへ載せると、50 GB を超えることがある。
+
+## 動作確認した環境
+
+macOS 27.0.1／Apple M1 Max（メモリ 64 GB）／Ollama 0.35.0／Claude Code 2.1.286／codex-cli 0.159.0／Rust 1.95.0／cmake 4.4.3／Swift 6.4
 
 ## ビルドと起動
 
@@ -46,6 +84,18 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 | Codex（常駐した `codex app-server`） | 約 2〜5 秒（ばらつきが大きい。初回の起動だけ約 5 秒） | ローカル Codex にサインイン済みの ChatGPT アカウントを使う。モデルは `model/list`（アカウントで使える一覧。既定は GPT-6.1-Sol）から選び、考える強さも選べる |
 | 翻訳しない | — | 原文のみ |
 
+## 翻訳先ごとの仕組み（どう接続しているか）
+
+アプリは、API キーを使わない。Claude と Codex は、お使いの PC に入っている公式のコマンドを、アプリが子プロセスとして起動して使う（ログインは、そのコマンドが持っているものをそのまま使う）。
+
+| 翻訳先 | 接続方法 |
+|---|---|
+| **Claude** | **`claude` コマンド（CLI）を起動**する。`claude -p` を標準入出力の stream-json 形式で 1 つ起動したままにして、字幕 1 行を 1 メッセージとして流し込む。考える処理（thinking）・ツール・フック・設定の読み込み・セッション保存は、すべて切ってある。履歴が積み上がるので、40 行ごとに新しいプロセスへ切り替える（次のプロセスは、裏で先に起動しておく）。 |
+| **Codex** | **`codex app-server`（App Server）を起動**して、標準入出力の JSON-RPC で話す。サーバーは 1 つで、その上に使い捨て（ephemeral）のスレッドを 6 本立てて、字幕を並列に翻訳する（`thread/start` → 字幕ごとに `turn/start` → `item/agentMessage/delta` と `turn/completed` を受け取る）。承認は `never`、sandbox は `read-only`。モデルの一覧は `model/list`、サインインの確認と開始は `account/read`・`account/login/start`。 |
+| **Ollama** | **HTTP の API** で話す（既定は `http://127.0.0.1:11434`。`OLLAMA_HOST` で変えられる）。翻訳は `POST /api/chat`（ストリームなし・考える処理なし・`keep_alive` 30 分）、モデル一覧は `/api/tags`、メモリ解放は `/api/ps` と `/api/generate`。 |
+
+Claude と Codex のプロセスは、「停止」を押したときと、アプリの終了時に止める。
+
 ## Ollama のメモリ解放
 
 大きなモデルは、メモリを数十 GB 使う。Taceta の「全モデル解放」と同じ方法（`/api/ps` で載っているモデルを調べ、各モデルに `keep_alive: 0` を送り、メモリから消えるまで待つ）で、次のときに解放する。**他のアプリが読み込んだモデルも対象**になる（次に使われたとき、再読み込みされる）。
@@ -57,6 +107,19 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 - アプリがパニックしたとき、または SIGTERM／SIGINT／SIGHUP で終了させられたとき
 
 Ollama が起動していなければ、起動はしない（載っているモデルはないものとして扱う）。強制終了などで、解放する機会がなかった場合は、次の起動時に片付く。それまでも、翻訳のリクエストに付けた `keep_alive`（30 分）を過ぎれば、Ollama が自分で解放する。
+
+**実機で確かめた結果**
+
+- 起動時: 起動の前に載っていた `gemma4:26b-mlx`（25.7 GB）と `qwen3.8:27b-mlx`（20.0 GB）が、起動直後に両方解放された（画面に「起動時: Ollama のモデルを 2 個、メモリから解放した」と出る）。
+- 終了時: `gpt-oss:20b`（13.7 GB）を載せてからアプリを終了すると、解放された。
+- 終了の合図（SIGTERM）: 同じく解放されてから、アプリが終了した。
+- 疑似の Ollama サーバーを使った単体テスト: 複数モデルの解放、何も載っていない場合、解放できないモデルの理由の表示、Ollama が動いていない場合。
+- 「メモリ解放」ボタンの押下と、モデル切り替え時の解放は、画面の操作が必要なので、自動の確認はしていない。
+
+**対象外**
+
+- Claude と Codex の子プロセスは、この機能の対象ではない。「停止」とアプリ終了のときに、別に止める。
+- Ollama 以外（whisper のモデルなど）のメモリは、解放しない。
 
 ## 環境変数
 
