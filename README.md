@@ -10,6 +10,7 @@ Mac で鳴っているすべての音声（YouTube・X・会議など、アプ�
 - 原文はすぐ表示し、日本語訳は完成し次第あとから差し込む（翻訳が遅くても字幕は止まらない）。
 - 日本語の発話は翻訳せずそのまま出す。
 - 画面上部に入力音声のメーターを出す（緑、大きいと黄色、無音は灰色で「無音」）。表示は自動音量補正のあとの音量で、バーに乗せると補正量（dB）が出る。
+- 「会話履歴を保存」を押したときだけ、いまの字幕（原文・訳・時刻）を日時つきのテキストファイルに保存して、Finder で表示する（既定では何も保存しない）。保存先は `~/Library/Application Support/LiveSubtitle/history/`。
 - モデル読み込み中（whisper・Ollama）は「…モデル読み込み中」と表示する。
 - ウィンドウは既定で最前面に固定（トグルで切り替え）。
 - 「帯にする」で、字幕だけの軽量表示（テロップ）になる。タイトルバーのない半透明の帯で、ドラッグで好きな位置へ動かし、端でサイズを変えられる（字幕の文字は帯の高さに合わせて大きくなる）。初回は画面の下部に出て、位置とサイズは次回も覚えている。しばらく発話が無いと消え、全画面表示の動画の上にも重なる。**ESC**（または帯に出る「元に戻す」ボタン）で、元のサイズと位置の通常画面に戻る。ESC は帯にフォーカスがあるときだけ効く（帯をクリックするとフォーカスされる）。
@@ -50,6 +51,7 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 | `LIVE_SUBTITLE_CLAUDE` | `claude` コマンドのパス |
 | `OLLAMA_HOST` | Ollama の接続先 |
 | `LIVE_SUBTITLE_AUTOSTART` | 設定すると起動と同時に聞き取りを始める |
+| `LIVE_SUBTITLE_HISTORY_DIR` | 「会話履歴を保存」の保存先 |
 | `LIVE_SUBTITLE_AUTOBAND` | 設定すると起動と同時に帯（テロップ）表示にする |
 | `LIVE_SUBTITLE_DEBUG_LOG` | 設定したパスに、入力レベル・区切り・認識・翻訳時間を追記する |
 
@@ -57,6 +59,7 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 
 - `src/capture.rs` システム音声の取得（ScreenCaptureKit、自アプリの音は除外）
 - `src/agc.rs` 自動音量補正（速く立ち上がり、ゆっくり戻る包絡線）
+- `src/history.rs` 会話履歴のファイル保存（ボタンを押したときだけ）
 - `src/pipeline.rs` 区切り検出（相対しきい値・最大 10 秒で強制分割）、whisper、翻訳スレッド
 - `src/translate.rs` Ollama / Claude の翻訳
 - `src/main.rs` GUI

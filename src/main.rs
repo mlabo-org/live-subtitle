@@ -3,6 +3,7 @@ mod app_shell_foundation;
 mod agc;
 mod band;
 mod capture;
+mod history;
 mod pipeline;
 mod translate;
 
@@ -23,7 +24,7 @@ const APP_SHELL_STORAGE_KEY: &str = "live-subtitle.app-shell-preferences.v1";
 const SETTINGS_STORAGE_KEY: &str = "live-subtitle.settings.v1";
 /// eframe's own storage key for the window position and size.
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
-const MAX_LINES: usize = 500;
+const MAX_LINES: usize = 5000;
 const BAND_VISIBLE_SECONDS: f64 = 10.0;
 const NORMAL_MIN_SIZE: [f32; 2] = [380.0, 260.0];
 const BAND_MIN_SIZE: [f32; 2] = [240.0, 70.0];
@@ -60,6 +61,7 @@ enum Japanese {
 
 struct Line {
     id: u64,
+    at: chrono::DateTime<chrono::Local>,
     lang: String,
     original: String,
     japanese: Japanese,
@@ -90,6 +92,8 @@ struct App {
     band_configured: bool,
     last_line_at: Option<Instant>,
     auto_band: bool,
+    /// One-line result of the last "save conversation" press.
+    notice: Option<String>,
 }
 
 impl App {
@@ -121,12 +125,37 @@ impl App {
             band: None,
             band_configured: false,
             last_line_at: None,
+            notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
         if autostart {
             app.start(&cc.egui_ctx);
         }
         app
+    }
+
+    /// Writes the subtitles gathered so far to a new text file and shows it in Finder.
+    fn save_conversation(&mut self) {
+        let records: Vec<history::Record> = self
+            .lines
+            .iter()
+            .map(|l| {
+                let (japanese, note) = match &l.japanese {
+                    Japanese::Done(ja) => (Some(ja.as_str()), None),
+                    Japanese::Pending => (None, Some("翻訳中".to_string())),
+                    Japanese::Failed(e) => (None, Some(format!("翻訳失敗: {e}"))),
+                    Japanese::NotNeeded => (None, None),
+                };
+                history::Record { at: l.at, lang: &l.lang, original: &l.original, japanese, note }
+            })
+            .collect();
+        self.notice = Some(match history::save(&history::history_dir(), &records) {
+            Ok(path) => {
+                let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                format!("{} 件を保存しました: {}", records.len(), path.display())
+            }
+            Err(e) => format!("保存できなかった: {e}"),
+        });
     }
 
     fn running(&self) -> bool {
@@ -173,7 +202,7 @@ impl App {
                     } else {
                         Japanese::Pending
                     };
-                    self.lines.push(Line { id, lang, original: text, japanese });
+                    self.lines.push(Line { id, at: chrono::Local::now(), lang, original: text, japanese });
                     self.last_line_at = Some(Instant::now());
                     if self.lines.len() > MAX_LINES {
                         self.lines.remove(0);
@@ -271,6 +300,9 @@ impl App {
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
         }
+        if let Some(notice) = &self.notice {
+            ui.colored_label(APP_SHELL_WEAK_TEXT, notice);
+        }
         ui.horizontal_wrapped(|ui| {
             let mut changed = false;
             let before_engine = self.persisted.translate.engine;
@@ -333,6 +365,13 @@ impl App {
                 ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
             }
             ui.checkbox(&mut self.persisted.show_original, "原文も表示");
+            if ui
+                .add_enabled(!self.lines.is_empty(), egui::Button::new("会話履歴を保存"))
+                .on_hover_text("いまの字幕（原文・訳・時刻）を、日時つきのテキストファイルに保存する")
+                .clicked()
+            {
+                self.save_conversation();
+            }
             if ui
                 .button("帯にする")
                 .on_hover_text("字幕だけの軽量表示にする。ドラッグで移動、端でサイズ変更。ESC で元に戻る")
