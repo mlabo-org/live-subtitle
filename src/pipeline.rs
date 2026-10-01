@@ -155,6 +155,8 @@ const KEEP_TAIL: usize = 10; // quiet frames kept at the end of an utterance
 const MIN_SPEECH: usize = 15; // shorter bursts are noise
 const MAX_FRAMES: usize = 500; // 10 s hard cap so continuous audio still produces subtitles
 const CUT_WINDOW: usize = 150; // the cap cuts at the quietest frame within the last 3 s
+const FLOOR_FALL: f32 = 0.2; // the floor drops to a quieter frame within a few frames
+const FLOOR_RISE: f32 = 0.002; // and creeps up toward a louder level over about ten seconds
 
 /// Energy-based utterance segmenter.
 ///
@@ -208,9 +210,10 @@ impl Segmenter {
             let frame: Vec<f32> = self.carry_leveled.drain(..FRAME).collect();
             let e = (raw_frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
             let voiced = e > (self.floor * 2.5).max(MIN_VOICED_RMS);
-            if !voiced {
-                self.floor = self.floor * 0.98 + e * 0.02;
-            }
+            // The floor follows the quietest recent level: the background between words. Averaging every
+            // unvoiced frame instead lets speech that is only a little above a steady background (wind, a
+            // crowd, music) pull the floor up to its own level, after which nothing counts as voiced.
+            self.floor += (e - self.floor) * if e < self.floor { FLOOR_FALL } else { FLOOR_RISE };
             self.frames.extend_from_slice(&frame);
             self.rms.push(e);
             if voiced {
@@ -411,4 +414,49 @@ fn run_asr(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod segmenter_tests {
+    use super::*;
+
+    /// One 20 ms frame of noise at the given RMS (a deterministic generator, so the test is repeatable).
+    fn frame(rms: f32, seed: &mut u32) -> Vec<f32> {
+        (0..FRAME)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((*seed >> 8) as f32 / 8_388_608.0 - 1.0) * rms * 1.732
+            })
+            .collect()
+    }
+
+    /// Speech over a background that never goes quiet (wind, a crowd, music): two seconds of speech every
+    /// three seconds, about three times as loud as the background, which itself swells and fades.
+    #[test]
+    fn speech_over_a_steady_background_is_still_split_into_utterances() {
+        let mut seg = Segmenter::new();
+        let mut seed = 7;
+        let mut heard = Vec::new(); // start and end of each utterance, in frames
+        let total = 50 * 90;
+        for t in 0..total {
+            let seconds = t as f32 / 50.0;
+            let background = 0.006 + 0.003 * (seconds * 0.3 * std::f32::consts::TAU).sin();
+            let speaking = seconds % 3.0 < 2.0;
+            let syllable = 0.5 + 0.5 * (seconds * 4.0 * std::f32::consts::TAU).sin().abs();
+            let level = if speaking { background + 0.02 * syllable } else { background };
+            let chunk = frame(level, &mut seed);
+            for utterance in seg.push(&chunk, &chunk) {
+                heard.push((t as i64 - (utterance.len() / FRAME) as i64, t as i64));
+            }
+        }
+        // A floor that drifts up to the level of the speech stops hearing it after some fifteen seconds, so
+        // the stretches of speech after the first half minute are the ones that must still reach whisper.
+        let missed = (10..29)
+            .filter(|n| {
+                let (from, to) = (n * 150, n * 150 + 100);
+                !heard.iter().any(|(a, b)| *a < to - 25 && *b > from + 25)
+            })
+            .count();
+        assert_eq!(missed, 0, "utterances: {heard:?}");
+    }
 }
