@@ -137,7 +137,7 @@ The Claude and Codex processes are stopped when you press "停止" (stop) and wh
 
 ## Releasing Ollama's memory
 
-A large model uses tens of GB of memory. The app frees it the same way Taceta's "release all models" does (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them).
+A large model uses tens of GB of memory. The app frees it the same way [Taceta](https://github.com/mlabo-org/taceta) (a native macOS client for local inference) does with its "release all models" button (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them).
 
 - When you press the "メモリ解放" (release memory) button
 - When the app starts (to clear what an abnormal exit left behind)
