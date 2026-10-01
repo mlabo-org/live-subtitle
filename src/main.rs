@@ -3,6 +3,8 @@ mod app_shell_foundation;
 mod agc;
 mod band;
 mod capture;
+mod claude;
+mod codex;
 mod history;
 mod pipeline;
 mod translate;
@@ -54,6 +56,17 @@ impl Default for Persisted {
     }
 }
 
+/// Sign-in state of the account behind a translation engine (Claude or Codex).
+#[derive(Clone, PartialEq)]
+enum Auth {
+    Unknown,
+    Checking,
+    SignedIn,
+    SignedOut,
+    SigningIn,
+    Failed(String),
+}
+
 enum Japanese {
     Pending,
     Done(String),
@@ -91,6 +104,15 @@ struct App {
     gain_db: f32,
     error: Option<String>,
     ollama_models: Vec<String>,
+    /// Text being typed into the Claude model field; committed on Enter or when focus leaves.
+    claude_model_edit: String,
+    codex_models: Vec<codex::ModelInfo>,
+    codex_models_rx: Option<Receiver<Result<Vec<codex::ModelInfo>, String>>>,
+    codex_models_tried: bool,
+    claude_auth: Auth,
+    codex_auth: Auth,
+    auth_tx: Sender<(Engine, Auth)>,
+    auth_rx: Receiver<(Engine, Auth)>,
     band: Option<BandState>,
     band_configured: bool,
     last_line_at: Option<Instant>,
@@ -104,12 +126,14 @@ impl App {
         install_macos_system_fonts(&cc.egui_ctx).expect("the managed macOS UI font must be available");
         let preferences = load_app_shell_preferences(cc.storage, APP_SHELL_STORAGE_KEY);
         apply_app_shell_preferences(&cc.egui_ctx, preferences);
-        let persisted: Persisted = cc
+        let mut persisted: Persisted = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_STORAGE_KEY))
             .unwrap_or_default();
+        persisted.translate.claude_model = translate::explicit_claude_model(&persisted.translate.claude_model);
         cc.egui_ctx.send_viewport_cmd(level_command(persisted.always_on_top));
         let (tx, rx) = mpsc::channel();
+        let (auth_tx, auth_rx) = mpsc::channel();
         let autostart = std::env::var_os("LIVE_SUBTITLE_AUTOSTART").is_some();
         let mut app = Self {
             preferences,
@@ -125,6 +149,14 @@ impl App {
             gain_db: 0.0,
             error: None,
             ollama_models: translate::ollama_models(),
+            claude_model_edit: String::new(),
+            codex_models: Vec::new(),
+            codex_models_rx: None,
+            codex_models_tried: false,
+            claude_auth: Auth::Unknown,
+            codex_auth: Auth::Unknown,
+            auth_tx,
+            auth_rx,
             band: None,
             band_configured: false,
             last_line_at: None,
@@ -161,6 +193,125 @@ impl App {
         });
     }
 
+    fn auth_mut(&mut self, engine: Engine) -> Option<&mut Auth> {
+        match engine {
+            Engine::Claude => Some(&mut self.claude_auth),
+            Engine::Codex => Some(&mut self.codex_auth),
+            Engine::Ollama | Engine::Off => None,
+        }
+    }
+
+    fn poll_auth(&mut self) {
+        while let Ok((engine, state)) = self.auth_rx.try_recv() {
+            if let Some(slot) = self.auth_mut(engine) {
+                *slot = state;
+            }
+        }
+    }
+
+    /// Reads the sign-in state in the background (read-only).
+    fn check_auth(&mut self, engine: Engine, ctx: &egui::Context) {
+        let Some(slot) = self.auth_mut(engine) else {
+            return;
+        };
+        *slot = Auth::Checking;
+        let (tx, ctx) = (self.auth_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = if engine == Engine::Claude { claude::signed_in() } else { codex::signed_in() };
+            let state = match result {
+                Ok(true) => Auth::SignedIn,
+                Ok(false) => Auth::SignedOut,
+                Err(e) => Auth::Failed(e),
+            };
+            let _ = tx.send((engine, state));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Starts the official browser sign-in; only ever called from the sign-in button.
+    fn sign_in(&mut self, engine: Engine, ctx: &egui::Context) {
+        let Some(slot) = self.auth_mut(engine) else {
+            return;
+        };
+        *slot = Auth::SigningIn;
+        let (tx, ctx) = (self.auth_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = if engine == Engine::Claude { claude::sign_in() } else { codex::sign_in() };
+            let state = match result {
+                Ok(()) => Auth::SignedIn,
+                Err(e) => Auth::Failed(e),
+            };
+            let _ = tx.send((engine, state));
+            ctx.request_repaint();
+        });
+    }
+
+    /// One line under the engine selector: whether the account is signed in, and the sign-in button.
+    fn auth_row(&mut self, ui: &mut egui::Ui, engine: Engine) {
+        let state = match engine {
+            Engine::Claude => self.claude_auth.clone(),
+            Engine::Codex => self.codex_auth.clone(),
+            Engine::Ollama | Engine::Off => return,
+        };
+        let who = if engine == Engine::Claude { "Claude" } else { "ChatGPT" };
+        let red = egui::Color32::from_rgb(220, 60, 60);
+        ui.horizontal_wrapped(|ui| match state {
+            Auth::Unknown | Auth::Checking => {
+                ui.spinner();
+                ui.label(format!("{who} のサインインを確認中…"));
+            }
+            Auth::SignedIn => {
+                ui.colored_label(METER_GREEN, format!("{who} にサインイン済み"));
+            }
+            Auth::SignedOut => {
+                ui.colored_label(red, format!("{who} にサインインしていません"));
+                if ui.button(format!("{who} にサインイン")).on_hover_text("ブラウザで公式のサインイン画面を開く").clicked() {
+                    self.sign_in(engine, ui.ctx());
+                }
+            }
+            Auth::SigningIn => {
+                ui.spinner();
+                ui.label("ブラウザでサインインを完了してください…");
+            }
+            Auth::Failed(e) => {
+                ui.colored_label(red, e);
+                if ui.small_button("再確認").clicked() {
+                    self.check_auth(engine, ui.ctx());
+                }
+                if ui.small_button(format!("{who} にサインイン")).clicked() {
+                    self.sign_in(engine, ui.ctx());
+                }
+            }
+        });
+    }
+
+    fn fetch_codex_models(&mut self, ctx: &egui::Context) {
+        if self.codex_models_rx.is_some() {
+            return;
+        }
+        self.codex_models_tried = true;
+        let (tx, rx) = mpsc::channel();
+        self.codex_models_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(codex::list_models());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_codex_models(&mut self) {
+        let Some(rx) = &self.codex_models_rx else {
+            return;
+        };
+        if let Ok(result) = rx.try_recv() {
+            self.codex_models_rx = None;
+            match result {
+                Ok(models) => self.codex_models = models,
+                Err(e) => self.error = Some(format!("Codex のモデル一覧を取れない: {e}")),
+            }
+        }
+    }
+
     fn running(&self) -> bool {
         self.pipeline.is_some()
     }
@@ -179,6 +330,7 @@ impl App {
 
     fn stop(&mut self) {
         self.pipeline = None;
+        translate::shutdown();
         self.asr = Stage::Idle;
         self.translator = Stage::Idle;
         self.level = 0.0;
@@ -317,11 +469,17 @@ impl App {
             let mut changed = false;
             let before_engine = self.persisted.translate.engine;
             let before_model = self.persisted.translate.ollama_model.clone();
+            let before_claude = self.persisted.translate.claude_model.clone();
+            let before_codex = (self.persisted.translate.codex_model.clone(), self.persisted.translate.codex_effort.clone());
+            self.poll_codex_models();
+            if self.persisted.translate.engine == Engine::Codex && !self.codex_models_tried {
+                self.fetch_codex_models(ui.ctx());
+            }
             ui.label("翻訳先");
             egui::ComboBox::from_id_salt("engine")
                 .selected_text(self.persisted.translate.engine.label())
                 .show_ui(ui, |ui| {
-                    for e in [Engine::Ollama, Engine::Claude, Engine::Off] {
+                    for e in [Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
                         changed |= ui
                             .selectable_value(&mut self.persisted.translate.engine, e, e.label())
                             .changed();
@@ -347,13 +505,70 @@ impl App {
                 }
                 Engine::Claude => {
                     let t = &mut self.persisted.translate;
-                    egui::ComboBox::from_id_salt("claude-model")
-                        .selected_text(t.claude_model.clone())
-                        .show_ui(ui, |ui| {
-                            for n in ["haiku", "sonnet", "opus"] {
-                                changed |= ui.selectable_value(&mut t.claude_model, n.to_string(), n).changed();
+                    let label = translate::CLAUDE_MODELS
+                        .iter()
+                        .find(|(id, _)| *id == t.claude_model)
+                        .map_or(t.claude_model.as_str(), |(_, label)| *label);
+                    egui::ComboBox::from_id_salt("claude-model").selected_text(label).show_ui(ui, |ui| {
+                        for (id, label) in translate::CLAUDE_MODELS {
+                            if ui.selectable_value(&mut t.claude_model, id.to_string(), label).changed() {
+                                changed = true;
+                                self.claude_model_edit = t.claude_model.clone();
                             }
-                        });
+                        }
+                    });
+                    if self.claude_model_edit.is_empty() {
+                        self.claude_model_edit = t.claude_model.clone();
+                    }
+                    let field = ui
+                        .add(egui::TextEdit::singleline(&mut self.claude_model_edit).desired_width(210.0))
+                        .on_hover_text("モデル ID を直接入力できる（Enter で確定）");
+                    if field.lost_focus() && self.claude_model_edit.trim() != t.claude_model {
+                        let id = self.claude_model_edit.trim().to_string();
+                        if !id.is_empty() {
+                            t.claude_model = id;
+                            changed = true;
+                        }
+                        self.claude_model_edit = t.claude_model.clone();
+                    }
+                }
+                Engine::Codex => {
+                    let t = &mut self.persisted.translate;
+                    let name = self
+                        .codex_models
+                        .iter()
+                        .find(|m| m.id == t.codex_model)
+                        .map_or(t.codex_model.as_str(), |m| m.name.as_str());
+                    egui::ComboBox::from_id_salt("codex-model").selected_text(name).show_ui(ui, |ui| {
+                        for m in &self.codex_models {
+                            if ui.selectable_value(&mut t.codex_model, m.id.clone(), &m.name).changed() {
+                                changed = true;
+                                if !t.codex_effort.is_empty() && !m.efforts.contains(&t.codex_effort) {
+                                    t.codex_effort.clear();
+                                }
+                            }
+                        }
+                    });
+                    let efforts = self
+                        .codex_models
+                        .iter()
+                        .find(|m| m.id == t.codex_model)
+                        .map(|m| m.efforts.clone())
+                        .unwrap_or_default();
+                    let effort_label = if t.codex_effort.is_empty() {
+                        "考える強さ: 既定".to_string()
+                    } else {
+                        format!("考える強さ: {}", t.codex_effort)
+                    };
+                    egui::ComboBox::from_id_salt("codex-effort").selected_text(effort_label).show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut t.codex_effort, String::new(), "既定").changed();
+                        for e in efforts {
+                            changed |= ui.selectable_value(&mut t.codex_effort, e.clone(), e).changed();
+                        }
+                    });
+                    if ui.small_button("更新").on_hover_text("Codex で使えるモデルの一覧を取り直す").clicked() {
+                        self.fetch_codex_models(ui.ctx());
+                    }
                 }
                 Engine::Off => {}
             }
@@ -362,14 +577,30 @@ impl App {
                     *s = self.persisted.translate.clone();
                 }
                 let t = &self.persisted.translate;
-                let reload = t.engine == Engine::Ollama
-                    && (before_engine != Engine::Ollama || before_model != t.ollama_model);
+                let reload = match t.engine {
+                    Engine::Ollama => before_engine != Engine::Ollama || before_model != t.ollama_model,
+                    Engine::Claude => before_engine != Engine::Claude || before_claude != t.claude_model,
+                    Engine::Codex => {
+                        before_engine != Engine::Codex || before_codex != (t.codex_model.clone(), t.codex_effort.clone())
+                    }
+                    Engine::Off => false,
+                };
                 if self.running() && reload {
                     let ctx = ui.ctx().clone();
                     pipeline::warm_up(self.shared.clone(), self.tx.clone(), move || ctx.request_repaint());
                 }
             }
         });
+        self.poll_auth();
+        let engine = self.persisted.translate.engine;
+        if matches!(engine, Engine::Claude | Engine::Codex) {
+            let unknown = matches!(engine, Engine::Claude if self.claude_auth == Auth::Unknown)
+                || matches!(engine, Engine::Codex if self.codex_auth == Auth::Unknown);
+            if unknown {
+                self.check_auth(engine, ui.ctx());
+            }
+            self.auth_row(ui, engine);
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.checkbox(&mut self.persisted.always_on_top, "最前面に固定").changed() {
                 ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
@@ -607,6 +838,10 @@ impl eframe::App for App {
             egui::Panel::top("controls").show_inside(ui, |ui| self.controls(ui));
             egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
         }
+    }
+
+    fn on_exit(&mut self) {
+        translate::shutdown();
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

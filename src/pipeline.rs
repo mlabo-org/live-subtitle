@@ -71,7 +71,7 @@ impl Pipeline {
 
         let _ = tx.send(Event::Asr(Stage::Loading));
         let engine = settings.lock().map(|s| s.engine).unwrap_or(Engine::Off);
-        if engine == Engine::Ollama {
+        if matches!(engine, Engine::Ollama | Engine::Claude | Engine::Codex) {
             warm_up(settings.clone(), tx.clone(), repaint.clone());
         } else {
             let _ = tx.send(Event::Translator(Stage::Idle));
@@ -95,7 +95,7 @@ impl Pipeline {
     }
 }
 
-/// Loads the Ollama model into memory so the first subtitle is not delayed by a cold start.
+/// Loads the translation model (Ollama) or starts the Claude session so the first subtitle is not delayed by a cold start.
 pub fn warm_up(
     settings: SharedSettings,
     tx: Sender<Event>,

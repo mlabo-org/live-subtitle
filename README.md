@@ -22,6 +22,8 @@ Mac で鳴っているすべての音声（YouTube・X・会議など、アプ�
   （取得元: `https://huggingface.co/ggerganov/whisper.cpp`。別の場所は `LIVE_SUBTITLE_MODEL` で指定）
 - 翻訳に Ollama を使うなら、Ollama が動いていてモデルが入っていること
 - 翻訳に Claude を使うなら、`claude` コマンド（`~/.local/bin` など。別の場所は `LIVE_SUBTITLE_CLAUDE`）
+- 翻訳に Codex を使うなら、`codex` コマンド（別の場所は `LIVE_SUBTITLE_CODEX`）
+- Claude と Codex は、サインインしていなければ、画面の「サインイン」ボタンから公式のブラウザ認証（OAuth）を始められる。アプリは認証情報を扱わず、状態の確認と、公式の手順の開始だけを行う（Claude は `claude auth`、Codex は App Server の `account/*`）。
 
 ## ビルドと起動
 
@@ -40,7 +42,8 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 | 選択 | 実測の遅延 | 備考 |
 |---|---|---|
 | Ollama（既定 `gemma4:26b-mlx`） | 約 0.7〜2 秒（初回の読み込みだけ約 13 秒。起動時に先読みする） | ローカル・オフライン |
-| Claude（`claude -p`） | 約 6〜10 秒 | 高品質。プラン枠を使う |
+| Claude（常駐した `claude -p`） | 約 0.7〜2 秒（モデル次第。初回の起動だけ約 6 秒で、その間は「翻訳モデル読み込み中」と出る） | 高品質。プラン枠を使う。モデルは版を明示した ID（Haiku 4.5・Sonnet 5.5・Opus 5.5・Fable 5.1）から選ぶか、ID を手入力する |
+| Codex（常駐した `codex app-server`） | 約 2〜5 秒（ばらつきが大きい。初回の起動だけ約 5 秒） | ローカル Codex にサインイン済みの ChatGPT アカウントを使う。モデルは `model/list`（アカウントで使える一覧。既定は GPT-6.1-Sol）から選び、考える強さも選べる |
 | 翻訳しない | — | 原文のみ |
 
 ## 環境変数
@@ -49,6 +52,7 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 |---|---|
 | `LIVE_SUBTITLE_MODEL` | whisper モデルのパス |
 | `LIVE_SUBTITLE_CLAUDE` | `claude` コマンドのパス |
+| `LIVE_SUBTITLE_CODEX` | `codex` コマンドのパス |
 | `OLLAMA_HOST` | Ollama の接続先 |
 | `LIVE_SUBTITLE_AUTOSTART` | 設定すると起動と同時に聞き取りを始める |
 | `LIVE_SUBTITLE_HISTORY_DIR` | 「会話履歴を保存」の保存先（画面で選んだ場所があれば、そちらが優先） |
@@ -61,7 +65,9 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 - `src/agc.rs` 自動音量補正（速く立ち上がり、ゆっくり戻る包絡線）
 - `src/history.rs` 会話履歴のファイル保存（ボタンを押したときだけ）
 - `src/pipeline.rs` 区切り検出（相対しきい値・最大 10 秒で強制分割）、whisper、翻訳スレッド
-- `src/translate.rs` Ollama / Claude の翻訳
+- `src/translate.rs` 翻訳先の切り替えと Ollama
+- `src/claude.rs` 常駐した Claude CLI での翻訳
+- `src/codex.rs` 常駐した Codex App Server での翻訳
 - `src/main.rs` GUI
 - `src/app_shell_foundation.rs` 表示設定の共通部品（app-shell-foundation が管理。編集しない）
 - `examples/capture-spike.rs` 音声取得だけの動作確認

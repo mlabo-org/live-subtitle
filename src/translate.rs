@@ -1,14 +1,36 @@
-//! Translation backends: a local Ollama server (fast) or the Claude CLI (high quality, slower).
+//! Translation backends: a local Ollama server or a long-lived Claude CLI session.
 
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::ChildStdout;
+use std::sync::mpsc::Receiver;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
+
+/// Claude models offered in the window: an explicit version, a short label. Aliases such as "haiku" are
+/// avoided because the version they point at changes with the CLI.
+pub const CLAUDE_MODELS: [(&str, &str); 4] = [
+    ("claude-haiku-4-5-20251001", "Haiku 4.5（最速・約0.7秒）"),
+    ("claude-sonnet-5-5", "Sonnet 5.5（自然・約1.7秒）"),
+    ("claude-opus-5-5", "Opus 5.5（自然・約2秒）"),
+    ("claude-fable-5-1", "Fable 5.1（高品質・約0.8秒）"),
+];
+
+/// Settings saved by earlier builds stored an alias; this returns the explicit model it stood for.
+pub fn explicit_claude_model(stored: &str) -> String {
+    match stored {
+        "haiku" => CLAUDE_MODELS[0].0,
+        "sonnet" => CLAUDE_MODELS[1].0,
+        "opus" => CLAUDE_MODELS[2].0,
+        other => other,
+    }
+    .to_string()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Engine {
     Ollama,
     Claude,
+    Codex,
     Off,
 }
 
@@ -16,17 +38,23 @@ impl Engine {
     pub fn label(self) -> &'static str {
         match self {
             Engine::Ollama => "Ollama（ローカル・速い）",
-            Engine::Claude => "Claude（高品質・遅い）",
+            Engine::Claude => "Claude（高品質）",
+            Engine::Codex => "Codex（ChatGPT アカウント）",
             Engine::Off => "翻訳しない（原文のみ）",
         }
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TranslateSettings {
     pub engine: Engine,
     pub ollama_model: String,
     pub claude_model: String,
+    /// A model id from Codex's `model/list`; the account's default model is `gpt-6.1-sol`.
+    pub codex_model: String,
+    /// Reasoning effort for Codex; empty means the model's own default.
+    pub codex_effort: String,
 }
 
 impl Default for TranslateSettings {
@@ -34,9 +62,55 @@ impl Default for TranslateSettings {
         Self {
             engine: Engine::Ollama,
             ollama_model: "gemma4:26b-mlx".into(),
-            claude_model: "haiku".into(),
+            claude_model: CLAUDE_MODELS[0].0.into(),
+            codex_model: "gpt-6.1-sol".into(),
+            codex_effort: String::new(),
         }
     }
+}
+
+/// System prompt of the long-lived Claude and Codex sessions, where each message is one subtitle line.
+pub const SUBTITLE_PROMPT: &str = "You are a live subtitle translator. Every user message is one subtitle line written as \
+`[source-language-code] text`, sometimes after a `Context` list of preceding lines. Reply with only the natural spoken \
+Japanese translation of the `[code] text` line: no notes, no quotation marks, no language tag; never translate the \
+context lines. Keep proper nouns recognizable. If the text is already Japanese, repeat it unchanged. Earlier messages \
+are earlier subtitle lines; use them for context only.";
+
+/// Reads a child's stdout line by line on its own thread so callers can wait with a timeout.
+pub fn spawn_line_reader(stdout: ChildStdout) -> Receiver<String> {
+    use std::io::{BufRead, BufReader};
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// How long a subtitle may wait for a free translator before it is shown untranslated, so the
+/// subtitles never fall further and further behind the speech.
+pub const QUEUE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Locks `mutex`, giving up with a "can't keep up" error after `QUEUE_LIMIT`.
+pub fn lock_within<T>(mutex: &Mutex<T>, wait: Duration) -> Result<MutexGuard<'_, T>, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => return Err("翻訳の状態が壊れた".into()),
+            Err(TryLockError::WouldBlock) if Instant::now() > deadline => return Err("翻訳が追いつかない".into()),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(15)),
+        }
+    }
+}
+
+/// Stops the long-lived Claude and Codex processes.
+pub fn shutdown() {
+    crate::claude::shutdown();
+    crate::codex::shutdown();
 }
 
 const SYSTEM_PROMPT: &str = "You are a live subtitle translator. Translate the user's text into natural spoken Japanese. \
@@ -65,7 +139,8 @@ pub fn translate(
     let system = system_prompt(lang, context);
     let out = match settings.engine {
         Engine::Ollama => ollama(&settings.ollama_model, &system, text)?,
-        Engine::Claude => claude(&settings.claude_model, &system, text)?,
+        Engine::Claude => crate::claude::translate(&settings.claude_model, lang, text)?,
+        Engine::Codex => crate::codex::translate(&settings.codex_model, &settings.codex_effort, context, lang, text)?,
         Engine::Off => return Ok(text.to_string()),
     };
     let out = out.trim().to_string();
@@ -124,57 +199,4 @@ pub fn ollama_models() -> Vec<String> {
         .as_array()
         .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
         .unwrap_or_default()
-}
-
-fn claude_binary() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("LIVE_SUBTITLE_CLAUDE") {
-        return Some(p.into());
-    }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    [
-        home.map(|h| h.join(".local/bin/claude")),
-        Some("/opt/homebrew/bin/claude".into()),
-        Some("/usr/local/bin/claude".into()),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| p.is_file())
-}
-
-fn claude(model: &str, system: &str, text: &str) -> Result<String, String> {
-    let bin = claude_binary().ok_or("claude コマンドが見つからない（LIVE_SUBTITLE_CLAUDE で指定できる）")?;
-    let mut child = Command::new(bin)
-        .args(["-p", "--model", model, "--tools", "", "--setting-sources", ""])
-        .args(["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"])
-        .args(["--system-prompt", system])
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("claude を起動できない: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("stdin を開けない")?
-        .write_all(text.as_bytes())
-        .map_err(|e| e.to_string())?;
-    let mut stdout = child.stdout.take().ok_or("stdout を開けない")?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) if status.success() => return reader.join().map_err(|_| "読み取り失敗".to_string()),
-            Some(status) => return Err(format!("claude が失敗: {status}")),
-            None if Instant::now() > deadline => {
-                let _ = child.kill();
-                return Err("claude がタイムアウト".into());
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
 }
