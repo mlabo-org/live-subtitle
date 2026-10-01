@@ -49,7 +49,7 @@ To keep the model elsewhere, set `LIVE_SUBTITLE_MODEL` to its path.
   ```
   Choose a model your Ollama can pull (the window's menu lists the installed ones). Large models use a lot of memory — see "Recommended translation model" and "Releasing Ollama's memory" below.
 - **Claude**: the `claude` command of Claude Code (for example in `~/.local/bin`; set `LIVE_SUBTITLE_CLAUDE` for another location). Sign-in is required (the button in the window can start it).
-- **Codex**: the `codex` command (set `LIVE_SUBTITLE_CODEX` for another location). Signing in with a ChatGPT account is required (the button in the window can start it).
+- **Codex**: the Codex **App Server**. The app starts it as `codex app-server`, using the same `codex` executable that the Codex CLI ships (set `LIVE_SUBTITLE_CODEX` for another location). It does not use `codex exec` or the interactive CLI. Signing in with a ChatGPT account is required (the button in the window can start it).
 
 If Claude or Codex is not signed in, the "サインイン" (sign in) button in the window starts the official browser OAuth flow. The app never handles credentials: it only checks the status and starts the official procedure (`claude auth` for Claude; the App Server's `account/*` methods for Codex).
 
@@ -69,7 +69,7 @@ If Claude or Codex is not signed in, the "サインイン" (sign in) button in t
 
 ## Verified environment
 
-macOS 27.0.1 / Apple M1 Max (64 GB) / Ollama 0.35.0 / Claude Code 2.1.286 / codex-cli 0.159.0 / Rust 1.95.0 / cmake 4.4.3 / Swift 6.4
+macOS 27.0.1 / Apple M1 Max (64 GB) / Ollama 0.35.0 / Claude Code 2.1.286 / Codex App Server 0.159.0 / Rust 1.95.0 / cmake 4.4.3 / Swift 6.4
 
 ## Build and run
 
@@ -138,7 +138,7 @@ The app uses no API keys. For Claude and Codex it starts the official commands a
 | **Codex** | **Starts `codex app-server` (the App Server)** and talks JSON-RPC over stdin/stdout. One server hosts six ephemeral threads, so lines are translated in parallel (`thread/start`, then `turn/start` per line, then it reads `item/agentMessage/delta` and `turn/completed`). Approval policy is `never` and the sandbox is `read-only`. The model list comes from `model/list`; sign-in status and start use `account/read` and `account/login/start`. |
 | **Ollama** | **HTTP API** (default `http://127.0.0.1:11434`, changeable with `OLLAMA_HOST`). Translation is `POST /api/chat` (no streaming, no thinking, `keep_alive` 30 min); the model list is `/api/tags`; memory release uses `/api/ps` and `/api/generate`. |
 
-The Claude and Codex processes are stopped when you press "停止" (stop) and when the app quits.
+Codex is reached through the App Server only; neither `codex exec` nor the interactive CLI is used. The Claude and Codex processes are stopped when you press "停止" (stop) and when the app quits.
 
 ## Releasing Ollama's memory
 
@@ -171,7 +171,7 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 |---|---|
 | `LIVE_SUBTITLE_MODEL` | path of the whisper model |
 | `LIVE_SUBTITLE_CLAUDE` | path of the `claude` command |
-| `LIVE_SUBTITLE_CODEX` | path of the `codex` command |
+| `LIVE_SUBTITLE_CODEX` | path of the `codex` executable (started as `codex app-server`) |
 | `OLLAMA_HOST` | where Ollama listens |
 | `LIVE_SUBTITLE_AUTOSTART` | when set, start listening as soon as the app starts |
 | `LIVE_SUBTITLE_HISTORY_DIR` | folder for "会話履歴を保存" (a folder chosen in the window takes precedence) |

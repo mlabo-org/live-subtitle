@@ -35,7 +35,7 @@
 4. **実行中のアプリの扱い**: `pgrep -f "Live Subtitle.app/Contents/MacOS"` で調べる。実行中なら、止める前に**必ずユーザーへ知らせる**（使用中の字幕が消える）。止めるときは `osascript -e 'tell application "Live Subtitle" to quit'` を使う（`pkill` や `kill` は使わない。終了時にモデルのメモリ解放を行う経路を通すため）。
 5. **ビルドとインストール**: `CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh`。出力は `~/Applications/Live Subtitle.app`。ビルドは一時ディレクトリで行う。`cargo run` は使わない。失敗したら、README の「つまずいたときは」を見る（iCloud 同期下の `codesign` 失敗、Swift の欠如が多い）。
 6. **起動の確認**: `open ~/Applications/"Live Subtitle.app"` のあと、数秒待って `pgrep -f "Live Subtitle.app/Contents/MacOS"` で動いていることを確かめる。
-7. **翻訳先の準備（ユーザーが使うものだけ）**: Ollama は `curl -s localhost:11434/api/tags` で動作とモデルを確認する。モデルが無ければ、`ollama pull gemma4:26b-mlx` を提案する（約 18 GB のダウンロードなので、許可を得る）。Claude は `claude` コマンド、Codex は `codex` コマンドが在ることの確認だけを行う。
+7. **翻訳先の準備（ユーザーが使うものだけ）**: Ollama は `curl -s localhost:11434/api/tags` で動作とモデルを確認する。モデルが無ければ、`ollama pull gemma4:26b-mlx` を提案する（約 18 GB のダウンロードなので、許可を得る）。Claude は `claude` コマンド、Codex は `codex` 実行ファイル（アプリは `codex app-server` として起動する。`codex exec` や対話式の CLI は使わない）が在ることの確認だけを行う。
 8. **ユーザーに頼むこと（エージェントは行わない）**: 画面収録とシステムオーディオ録音の許可（システム設定）、Claude／ChatGPT のサインイン（画面のボタン）、フォルダへのアクセスの確認ダイアログ。システム設定を変えない。認証情報を扱わない。サインインのボタンを押さない。許可の手順は README の「macOS の許可」を案内する。
 9. **完了の報告**: インストール先、起動の確認結果、ユーザーに残っている手作業（上の 8）を伝える。ソースの変更だけで、アプリを入れ替えていないときは、そう報告する（ソース・ビルド・入れ替えは別の段階）。
 

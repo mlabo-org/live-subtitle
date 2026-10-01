@@ -47,7 +47,7 @@ curl -L -o ~/"Library/Application Support/LiveSubtitle/ggml-large-v3-turbo-q5_0.
   ```
   モデル名は、お使いの Ollama で取得できるものを選ぶ（画面のメニューに、入っているモデルが並ぶ）。大きなモデルは、メモリを大量に使う（下の「おすすめの翻訳モデル」と「Ollama のメモリ解放」を参照）。
 - **Claude**: Claude Code の `claude` コマンド（`~/.local/bin` など。別の場所は `LIVE_SUBTITLE_CLAUDE`）。サインインが要る（画面のボタンから始められる）。
-- **Codex**: `codex` コマンド（別の場所は `LIVE_SUBTITLE_CODEX`）。ChatGPT アカウントでのサインインが要る（画面のボタンから始められる）。
+- **Codex**: Codex の **App Server**。アプリが `codex app-server` として起動する（Codex CLI と同じ `codex` 実行ファイルを使う。別の場所は `LIVE_SUBTITLE_CODEX`）。`codex exec` や対話式の CLI は使わない。ChatGPT アカウントでのサインインが要る（画面のボタンから始められる）。
 
 Claude と Codex は、サインインしていなければ、画面の「サインイン」ボタンから公式のブラウザ認証（OAuth）を始められる。アプリは認証情報を扱わず、状態の確認と、公式の手順の開始だけを行う（Claude は `claude auth`、Codex は App Server の `account/*`）。
 
@@ -67,7 +67,7 @@ Claude と Codex は、サインインしていなければ、画面の「サイ
 
 ## 動作確認した環境
 
-macOS 27.0.1／Apple M1 Max（メモリ 64 GB）／Ollama 0.35.0／Claude Code 2.1.286／codex-cli 0.159.0／Rust 1.95.0／cmake 4.4.3／Swift 6.4
+macOS 27.0.1／Apple M1 Max（メモリ 64 GB）／Ollama 0.35.0／Claude Code 2.1.286／Codex App Server 0.159.0／Rust 1.95.0／cmake 4.4.3／Swift 6.4
 
 ## ビルドと起動
 
@@ -137,7 +137,7 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 | **Codex** | **`codex app-server`（App Server）を起動**して、標準入出力の JSON-RPC で話す。サーバーは 1 つで、その上に使い捨て（ephemeral）のスレッドを 6 本立てて、字幕を並列に翻訳する（`thread/start` → 字幕ごとに `turn/start` → `item/agentMessage/delta` と `turn/completed` を受け取る）。承認は `never`、sandbox は `read-only`。モデルの一覧は `model/list`、サインインの確認と開始は `account/read`・`account/login/start`。 |
 | **Ollama** | **HTTP の API** で話す（既定は `http://127.0.0.1:11434`。`OLLAMA_HOST` で変えられる）。翻訳は `POST /api/chat`（ストリームなし・考える処理なし・`keep_alive` 30 分）、モデル一覧は `/api/tags`、メモリ解放は `/api/ps` と `/api/generate`。 |
 
-Claude と Codex のプロセスは、「停止」を押したときと、アプリの終了時に止める。
+Codex は App Server 経由だけで使い、`codex exec` や対話式の CLI は使わない。Claude と Codex のプロセスは、「停止」を押したときと、アプリの終了時に止める。
 
 ## Ollama のメモリ解放
 
@@ -170,7 +170,7 @@ Ollama が起動していなければ、起動はしない（載っているモ�
 |---|---|
 | `LIVE_SUBTITLE_MODEL` | whisper モデルのパス |
 | `LIVE_SUBTITLE_CLAUDE` | `claude` コマンドのパス |
-| `LIVE_SUBTITLE_CODEX` | `codex` コマンドのパス |
+| `LIVE_SUBTITLE_CODEX` | `codex` 実行ファイルのパス（`codex app-server` として起動する） |
 | `OLLAMA_HOST` | Ollama の接続先 |
 | `LIVE_SUBTITLE_AUTOSTART` | 設定すると起動と同時に聞き取りを始める |
 | `LIVE_SUBTITLE_HISTORY_DIR` | 「会話履歴を保存」の保存先（画面で選んだ場所があれば、そちらが優先） |
