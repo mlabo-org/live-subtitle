@@ -159,12 +159,18 @@ pub fn translate(
         Engine::Codex => crate::codex::translate(&settings.codex_model, &settings.codex_effort, context, lang, text)?,
         Engine::Off => return Ok(text.to_string()),
     };
-    let out = out.trim().to_string();
+    let out = single_line(&out);
     if out.is_empty() {
         Err("翻訳結果が空".into())
     } else {
         Ok(out)
     }
+}
+
+/// A model sometimes answers one sentence per line. A subtitle is one run of text (the band shows two rows,
+/// so a reply of five short lines would lose three), so the lines are joined.
+fn single_line(reply: &str) -> String {
+    reply.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
 /// Gets the engine ready so the first subtitle is not slowed by a cold start: Ollama loads its model and Codex
@@ -338,6 +344,18 @@ fn unload_all_at(host: &str) -> Result<usize, String> {
             return Err("モデルの解放が 30 秒で終わらなかった".into());
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::single_line;
+
+    #[test]
+    fn a_reply_with_one_sentence_per_line_becomes_one_line() {
+        assert_eq!(single_line("気に入った？\nすごく気に入った。\n\n  どこに住んでるの？\n"), "気に入った？ すごく気に入った。 どこに住んでるの？");
+        assert_eq!(single_line("  やあ。 元気？ "), "やあ。 元気？");
+        assert_eq!(single_line(" \n "), "");
     }
 }
 
