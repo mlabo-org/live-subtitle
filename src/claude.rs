@@ -1,20 +1,23 @@
-//! Translation through a long-lived `claude -p` process (stream-json in and out).
+//! Translation through long-lived `claude -p` processes (stream-json in and out).
 //!
-//! Starting `claude` takes seconds, so one process is kept running and every subtitle line is one more
+//! Starting `claude` takes seconds, so a process is kept running and every subtitle line is one more
 //! message to it. Extended thinking is off, and the reply is taken as soon as its stream ends instead of
-//! waiting for the final result message. The conversation grows with every message, so the session is
-//! replaced after `RECYCLE_AFTER` lines; the replacement is prepared in the background beforehand.
+//! waiting for the final result message. One process translates one line at a time, which is slower than
+//! people talk, so up to `SESSIONS` of them run side by side; the second and third start only when a line
+//! finds the others busy. The conversation grows with every message, so a session is replaced after
+//! `RECYCLE_AFTER` lines; the replacement is prepared in the background beforehand.
 
 use serde_json::{json, Value};
-use crate::translate::{lock_within, spawn_line_reader, QUEUE_LIMIT, SUBTITLE_PROMPT};
+use crate::translate::{spawn_line_reader, subtitle_message, QUEUE_LIMIT, SUBTITLE_PROMPT};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
+const SESSIONS: usize = 3;
 const RECYCLE_AFTER: usize = 40;
 const PREPARE_AT: usize = 30;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -29,7 +32,7 @@ struct Session {
     outstanding: usize,
 }
 
-static ACTIVE: Mutex<Option<Session>> = Mutex::new(None);
+static SLOTS: [Mutex<Option<Session>>; SESSIONS] = [const { Mutex::new(None) }; SESSIONS];
 static SPARE: Mutex<Option<Session>> = Mutex::new(None);
 static PREPARING: AtomicBool = AtomicBool::new(false);
 
@@ -74,14 +77,14 @@ impl Session {
         let stdout = child.stdout.take().ok_or("stdout を開けない")?;
         let lines = spawn_line_reader(stdout);
         let mut session = Self { child, stdin, lines, model: model.to_string(), requests: 0, outstanding: 0 };
-        session.ask("en", "Hello.")?;
+        session.ask(&subtitle_message(&[], "en", "Hello."))?;
         Ok(session)
     }
 
-    fn ask(&mut self, lang: &str, text: &str) -> Result<String, String> {
+    fn ask(&mut self, content: &str) -> Result<String, String> {
         let message = json!({
             "type": "user",
-            "message": { "role": "user", "content": format!("[{lang}] {text}") },
+            "message": { "role": "user", "content": content },
         });
         writeln!(self.stdin, "{message}")
             .and_then(|()| self.stdin.flush())
@@ -148,8 +151,34 @@ fn prepare_spare(model: &str) {
     });
 }
 
-/// The session for `model`, started first when none is running, or when the running one is for another model
-/// or due for replacement.
+/// A slot nobody is using, waiting up to `QUEUE_LIMIT` for one. A slot whose session already runs `model` is
+/// preferred, so unhurried speech stays with one process and the others start only under load.
+fn free_slot(model: &str) -> Result<MutexGuard<'static, Option<Session>>, String> {
+    let deadline = Instant::now() + QUEUE_LIMIT;
+    loop {
+        let mut idle = None;
+        for slot in &SLOTS {
+            match slot.try_lock() {
+                Ok(guard) if guard.as_ref().is_some_and(|s| s.model == model) => return Ok(guard),
+                Ok(guard) => {
+                    idle.get_or_insert(guard);
+                }
+                Err(TryLockError::Poisoned(_)) => return Err("翻訳の状態が壊れた".into()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        if let Some(guard) = idle {
+            return Ok(guard);
+        }
+        if Instant::now() > deadline {
+            return Err("翻訳が追いつかない".into());
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+/// The slot's session for `model`, started first when none is running, or when the running one is for another
+/// model or due for replacement.
 fn current<'a>(active: &'a mut Option<Session>, model: &str) -> Result<&'a mut Session, String> {
     if active.as_ref().is_none_or(|s| s.model != model || s.requests >= RECYCLE_AFTER) {
         *active = None;
@@ -161,20 +190,28 @@ fn current<'a>(active: &'a mut Option<Session>, model: &str) -> Result<&'a mut S
     active.as_mut().ok_or_else(|| "claude のセッションが無い".to_string())
 }
 
-/// Starts the session for `model` ahead of the first subtitle. Starting one already sends the greeting.
+/// Starts one session for `model` ahead of the first subtitle (starting one already sends the greeting) and
+/// stops idle sessions left over from another model.
 pub fn warm_up(model: &str) -> Result<(), String> {
-    let mut active = lock_within(&ACTIVE, QUEUE_LIMIT)?;
+    for slot in &SLOTS {
+        if let Ok(mut session) = slot.try_lock() {
+            if session.as_ref().is_some_and(|s| s.model != model) {
+                *session = None;
+            }
+        }
+    }
+    let mut active = free_slot(model)?;
     current(&mut active, model).map(|_| ())
 }
 
-/// Translates one subtitle line. Calls are served one at a time by the single running session.
-pub fn translate(model: &str, lang: &str, text: &str) -> Result<String, String> {
-    let mut active = lock_within(&ACTIVE, QUEUE_LIMIT)?;
+/// Translates one subtitle line; up to `SESSIONS` lines are translated at the same time.
+pub fn translate(model: &str, context: &[String], lang: &str, text: &str) -> Result<String, String> {
+    let mut active = free_slot(model)?;
     let session = current(&mut active, model)?;
     if session.requests == PREPARE_AT {
         prepare_spare(model);
     }
-    match session.ask(lang, text) {
+    match session.ask(&subtitle_message(context, lang, text)) {
         Ok(reply) => Ok(reply),
         Err(e) => {
             *active = None; // start over with a fresh process next time
@@ -183,10 +220,12 @@ pub fn translate(model: &str, lang: &str, text: &str) -> Result<String, String> 
     }
 }
 
-/// Stops the running session and any prepared replacement.
+/// Stops the running sessions and any prepared replacement.
 pub fn shutdown() {
-    if let Ok(mut active) = ACTIVE.lock() {
-        *active = None;
+    for slot in &SLOTS {
+        if let Ok(mut session) = slot.lock() {
+            *session = None;
+        }
     }
     if let Ok(mut spare) = SPARE.lock() {
         *spare = None;

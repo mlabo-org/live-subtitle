@@ -1,4 +1,4 @@
-//! Translation backends: a local Ollama server or a long-lived Claude CLI session.
+//! Translation backends: a local Ollama server, long-lived Claude CLI sessions, or a Codex App Server.
 
 use serde::{Deserialize, Serialize};
 use std::process::ChildStdout;
@@ -77,6 +77,21 @@ Japanese translation of the `[code] text` line: no notes, no quotation marks, no
 context lines. Keep proper nouns recognizable. If the text is already Japanese, repeat it unchanged. Earlier messages \
 are earlier subtitle lines; use them for context only.";
 
+/// One subtitle line as the long-lived Claude and Codex sessions are sent it (the form `SUBTITLE_PROMPT` describes).
+/// The preceding lines travel with it because several sessions share the work and none has seen every line.
+pub fn subtitle_message(context: &[String], lang: &str, text: &str) -> String {
+    let mut message = String::new();
+    if !context.is_empty() {
+        message.push_str("Context (preceding lines, do not translate):\n");
+        for line in context {
+            message.push_str(&format!("- {line}\n"));
+        }
+        message.push_str("Translate this line:\n");
+    }
+    message.push_str(&format!("[{lang}] {text}"));
+    message
+}
+
 /// Reads a child's stdout line by line on its own thread so callers can wait with a timeout.
 pub fn spawn_line_reader(stdout: ChildStdout) -> Receiver<String> {
     use std::io::{BufRead, BufReader};
@@ -140,7 +155,7 @@ pub fn translate(
     let system = system_prompt(lang, context);
     let out = match settings.engine {
         Engine::Ollama => ollama(&settings.ollama_model, &system, text)?,
-        Engine::Claude => crate::claude::translate(&settings.claude_model, lang, text)?,
+        Engine::Claude => crate::claude::translate(&settings.claude_model, context, lang, text)?,
         Engine::Codex => crate::codex::translate(&settings.codex_model, &settings.codex_effort, context, lang, text)?,
         Engine::Off => return Ok(text.to_string()),
     };
@@ -159,7 +174,11 @@ pub fn warm_up(settings: &TranslateSettings) {
         Engine::Claude => {
             let _ = crate::claude::warm_up(&settings.claude_model);
         }
-        Engine::Ollama | Engine::Codex => {
+        Engine::Ollama => {
+            let _loading = OLLAMA_LOADING.lock();
+            let _ = ollama_request(&settings.ollama_model, &system_prompt("en", &[]), "Hello.");
+        }
+        Engine::Codex => {
             let _ = translate(settings, "Hello.", "en", &[]);
         }
         Engine::Off => {}
@@ -187,7 +206,21 @@ pub fn close_ollama() {
     OLLAMA_CLOSED.store(true, Ordering::SeqCst);
 }
 
+/// Held while the warm-up loads the model (about 13 s), so lines heard meanwhile wait for the load instead of
+/// being given up after `QUEUE_LIMIT`.
+static OLLAMA_LOADING: Mutex<()> = Mutex::new(());
+
+/// Ollama is asked for one line at a time. Without this the server would queue every line, however late.
+static OLLAMA_TURN: Mutex<()> = Mutex::new(());
+
+/// Translates one line, giving up when the lines ahead of it take longer than `QUEUE_LIMIT`.
 fn ollama(model: &str, system: &str, text: &str) -> Result<String, String> {
+    drop(OLLAMA_LOADING.lock());
+    let _turn = lock_within(&OLLAMA_TURN, QUEUE_LIMIT)?;
+    ollama_request(model, system, text)
+}
+
+fn ollama_request(model: &str, system: &str, text: &str) -> Result<String, String> {
     if OLLAMA_CLOSED.load(Ordering::SeqCst) {
         return Err("終了処理中".into());
     }

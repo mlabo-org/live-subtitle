@@ -133,7 +133,7 @@ CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh   # 既定の出力先: ~/Appl
 
 | 翻訳先 | 接続方法 |
 |---|---|
-| **Claude** | **`claude` コマンド（CLI）を起動**する。`claude -p` を標準入出力の stream-json 形式で 1 つ起動したままにして、字幕 1 行を 1 メッセージとして流し込む。考える処理（thinking）・ツール・フック・設定の読み込み・セッション保存は、すべて切ってある。履歴が積み上がるので、40 行ごとに新しいプロセスへ切り替える（次のプロセスは、裏で先に起動しておく）。 |
+| **Claude** | **`claude` コマンド（CLI）を起動**する。`claude -p` を標準入出力の stream-json 形式で起動したままにして、字幕 1 行を 1 メッセージとして流し込む。ふだんは 1 つだけで、発話が続いて翻訳が追いつかないときだけ、最大 3 つまで増やして並行して訳す（増えたプロセスは「停止」まで残る）。どのプロセスにも文脈が伝わるように、直前の 3 行をメッセージに添える。考える処理（thinking）・ツール・フック・設定の読み込み・セッション保存は、すべて切ってある。履歴が積み上がるので、プロセスごとに 40 行で新しいプロセスへ切り替える（次のプロセスは、裏で先に起動しておく）。 |
 | **Codex** | **`codex app-server`（App Server）を起動**して、標準入出力の JSON-RPC で話す。サーバーは 1 つで、その上に使い捨て（ephemeral）のスレッドを 6 本立てて、字幕を並列に翻訳する（`thread/start` → 字幕ごとに `turn/start` → `item/agentMessage/delta` と `turn/completed` を受け取る）。承認は `never`、sandbox は `read-only`。モデルの一覧は `model/list`、サインインの確認と開始は `account/read`・`account/login/start`。 |
 | **Ollama** | **HTTP の API** で話す（既定は `http://127.0.0.1:11434`。`OLLAMA_HOST` で変えられる）。翻訳は `POST /api/chat`（ストリームなし・考える処理なし・`keep_alive` 30 分）、モデル一覧は `/api/tags`、メモリ解放は `/api/ps` と `/api/generate`。 |
 

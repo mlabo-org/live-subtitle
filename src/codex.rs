@@ -6,7 +6,7 @@
 //! notifications by thread id). A slot's thread is replaced after `NEW_THREAD_AFTER` turns so its history does
 //! not grow without bound. Authentication is the signed-in ChatGPT account of the local Codex.
 
-use crate::translate::{lock_within, SUBTITLE_PROMPT, QUEUE_LIMIT};
+use crate::translate::{lock_within, subtitle_message, SUBTITLE_PROMPT, QUEUE_LIMIT};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -226,15 +226,7 @@ impl Pool {
         slot.turns += 1;
         while slot.events.try_recv().is_ok() {} // leftovers of an earlier turn
 
-        let mut message = String::new();
-        if !context.is_empty() {
-            message.push_str("Context (preceding lines, do not translate):\n");
-            for line in context {
-                message.push_str(&format!("- {line}\n"));
-            }
-            message.push_str("Translate this line:\n");
-        }
-        message.push_str(&format!("[{lang}] {text}"));
+        let message = subtitle_message(context, lang, text);
         let mut params = json!({ "threadId": slot.thread_id, "input": [{ "type": "text", "text": message }] });
         if !self.effort.is_empty() {
             params["effort"] = json!(self.effort);
