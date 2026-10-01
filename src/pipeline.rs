@@ -130,7 +130,7 @@ pub fn warm_up(
     repaint();
     std::thread::spawn(move || {
         let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
-        let _ = translate::translate(&s, "Hello.", "en", &[]);
+        translate::warm_up(&s);
         let _ = tx.send(Event::Translator(Stage::Ready));
         repaint();
     });
@@ -300,11 +300,11 @@ fn run_asr(
     repaint: &(impl Fn() + Send + Sync + Clone + 'static),
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let ctx = WhisperContext::new_with_params(
-        model.to_str().ok_or("モデルのパスが不正")?,
-        WhisperContextParameters::default(),
-    )
-    .map_err(|e| format!("whisper のモデルを読み込めない: {e}"))?;
+    // whisper-rs switches flash attention off by default; whisper.cpp itself has it on, and it is faster on Metal.
+    let mut context_params = WhisperContextParameters::default();
+    context_params.flash_attn(true);
+    let ctx = WhisperContext::new_with_params(model.to_str().ok_or("モデルのパスが不正")?, context_params)
+        .map_err(|e| format!("whisper のモデルを読み込めない: {e}"))?;
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
     let _ = tx.send(Event::Asr(Stage::Ready));
     repaint();

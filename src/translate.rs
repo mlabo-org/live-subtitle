@@ -152,6 +152,20 @@ pub fn translate(
     }
 }
 
+/// Gets the engine ready so the first subtitle is not slowed by a cold start: Ollama loads its model and Codex
+/// runs one turn; a new Claude session greets the model by itself, so it only has to be started.
+pub fn warm_up(settings: &TranslateSettings) {
+    match settings.engine {
+        Engine::Claude => {
+            let _ = crate::claude::warm_up(&settings.claude_model);
+        }
+        Engine::Ollama | Engine::Codex => {
+            let _ = translate(settings, "Hello.", "en", &[]);
+        }
+        Engine::Off => {}
+    }
+}
+
 fn ollama_host() -> String {
     std::env::var("OLLAMA_HOST")
         .ok()

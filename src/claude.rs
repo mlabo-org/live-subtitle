@@ -148,9 +148,9 @@ fn prepare_spare(model: &str) {
     });
 }
 
-/// Translates one subtitle line. Calls are served one at a time by the single running session.
-pub fn translate(model: &str, lang: &str, text: &str) -> Result<String, String> {
-    let mut active = lock_within(&ACTIVE, QUEUE_LIMIT)?;
+/// The session for `model`, started first when none is running, or when the running one is for another model
+/// or due for replacement.
+fn current<'a>(active: &'a mut Option<Session>, model: &str) -> Result<&'a mut Session, String> {
     if active.as_ref().is_none_or(|s| s.model != model || s.requests >= RECYCLE_AFTER) {
         *active = None;
         *active = Some(match take_spare(model) {
@@ -158,9 +158,19 @@ pub fn translate(model: &str, lang: &str, text: &str) -> Result<String, String> 
             None => Session::spawn(model)?,
         });
     }
-    let Some(session) = active.as_mut() else {
-        return Err("claude のセッションが無い".into());
-    };
+    active.as_mut().ok_or_else(|| "claude のセッションが無い".to_string())
+}
+
+/// Starts the session for `model` ahead of the first subtitle. Starting one already sends the greeting.
+pub fn warm_up(model: &str) -> Result<(), String> {
+    let mut active = lock_within(&ACTIVE, QUEUE_LIMIT)?;
+    current(&mut active, model).map(|_| ())
+}
+
+/// Translates one subtitle line. Calls are served one at a time by the single running session.
+pub fn translate(model: &str, lang: &str, text: &str) -> Result<String, String> {
+    let mut active = lock_within(&ACTIVE, QUEUE_LIMIT)?;
+    let session = current(&mut active, model)?;
     if session.requests == PREPARE_AT {
         prepare_spare(model);
     }
