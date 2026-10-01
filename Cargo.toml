@@ -1,0 +1,16 @@
+[package]
+name = "live-subtitle"
+version = "0.1.0"
+edition = "2021"
+description = "Captures all system audio on macOS, transcribes it with whisper.cpp and shows Japanese subtitles"
+
+[dependencies]
+eframe = { version = "0.34", features = ["persistence"] }
+screencapturekit = "11"
+whisper-rs = { version = "0.16", features = ["metal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+opt-level = 3

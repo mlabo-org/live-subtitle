@@ -1,0 +1,343 @@
+//! capture → utterance segmentation → whisper → translation, each stage on its own thread.
+
+use crate::capture::{Capture, SAMPLE_RATE};
+use crate::translate::{self, Engine, TranslateSettings};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Loading,
+    Ready,
+    Idle,
+}
+
+pub enum Event {
+    /// Speech recognition model state.
+    Asr(Stage),
+    /// Translation model state (Ollama warm-up).
+    Translator(Stage),
+    Level(f32),
+    Heard { id: u64, lang: String, text: String },
+    Translated { id: u64, text: String },
+    TranslateFailed { id: u64, error: String },
+    Fatal(String),
+}
+
+pub type SharedSettings = Arc<Mutex<TranslateSettings>>;
+
+pub struct Pipeline {
+    _capture: Capture,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn model_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("LIVE_SUBTITLE_MODEL") {
+        return p.into();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join("Library/Application Support/LiveSubtitle/ggml-large-v3-turbo-q5_0.bin")
+}
+
+impl Pipeline {
+    pub fn start(
+        settings: SharedSettings,
+        tx: Sender<Event>,
+        repaint: impl Fn() + Send + Sync + Clone + 'static,
+    ) -> Result<Self, String> {
+        let model = model_path();
+        if !model.is_file() {
+            return Err(format!(
+                "whisper のモデルが無い: {}（LIVE_SUBTITLE_MODEL で場所を指定できる）",
+                model.display()
+            ));
+        }
+        let (audio_tx, audio_rx) = mpsc::channel();
+        let capture = Capture::start(audio_tx)?;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let _ = tx.send(Event::Asr(Stage::Loading));
+        let engine = settings.lock().map(|s| s.engine).unwrap_or(Engine::Off);
+        if engine == Engine::Ollama {
+            warm_up(settings.clone(), tx.clone(), repaint.clone());
+        } else {
+            let _ = tx.send(Event::Translator(Stage::Idle));
+        }
+
+        let stop_asr = stop.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = run_asr(audio_rx, &model, settings, &tx, &repaint, &stop_asr) {
+                let _ = tx.send(Event::Fatal(e));
+                repaint();
+            }
+        });
+        Ok(Self { _capture: capture, stop })
+    }
+}
+
+/// Loads the Ollama model into memory so the first subtitle is not delayed by a cold start.
+pub fn warm_up(
+    settings: SharedSettings,
+    tx: Sender<Event>,
+    repaint: impl Fn() + Send + Sync + 'static,
+) {
+    let _ = tx.send(Event::Translator(Stage::Loading));
+    repaint();
+    std::thread::spawn(move || {
+        let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
+        let _ = translate::translate(&s, "Hello.", "en", &[]);
+        let _ = tx.send(Event::Translator(Stage::Ready));
+        repaint();
+    });
+}
+
+/// System audio often arrives quiet, so the absolute floor for "voiced" is low and the real test is relative.
+const MIN_VOICED_RMS: f32 = 0.0025;
+const FRAME: usize = SAMPLE_RATE as usize / 50; // 20 ms
+const PRE_ROLL: usize = 15; // 300 ms kept before the first voiced frame
+const END_SILENCE: usize = 25; // 500 ms of quiet ends an utterance
+const KEEP_TAIL: usize = 10; // quiet frames kept at the end of an utterance
+const MIN_SPEECH: usize = 15; // shorter bursts are noise
+const MAX_FRAMES: usize = 500; // 10 s hard cap so continuous audio still produces subtitles
+const CUT_WINDOW: usize = 150; // the cap cuts at the quietest frame within the last 3 s
+
+/// Energy-based utterance segmenter.
+struct Segmenter {
+    carry: Vec<f32>,
+    frames: Vec<f32>,
+    rms: Vec<f32>,
+    in_speech: bool,
+    speech: usize,
+    silence: usize,
+    floor: f32,
+}
+
+impl Segmenter {
+    fn new() -> Self {
+        Self {
+            carry: Vec::new(),
+            frames: Vec::new(),
+            rms: Vec::new(),
+            in_speech: false,
+            speech: 0,
+            silence: 0,
+            floor: 0.002,
+        }
+    }
+
+    fn debug(&self) -> String {
+        format!(
+            "in_speech={} speech={} silence={} frames={} floor={:.4}",
+            self.in_speech, self.speech, self.silence, self.rms.len(), self.floor
+        )
+    }
+
+    fn reset(&mut self) {
+        self.frames.clear();
+        self.rms.clear();
+        self.in_speech = false;
+        self.speech = 0;
+        self.silence = 0;
+    }
+
+    fn push(&mut self, chunk: &[f32]) -> Vec<Vec<f32>> {
+        self.carry.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while self.carry.len() >= FRAME {
+            let frame: Vec<f32> = self.carry.drain(..FRAME).collect();
+            let e = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
+            let voiced = e > (self.floor * 2.5).max(MIN_VOICED_RMS);
+            if !voiced {
+                self.floor = self.floor * 0.98 + e * 0.02;
+            }
+            self.frames.extend_from_slice(&frame);
+            self.rms.push(e);
+            if voiced {
+                self.speech += 1;
+                self.silence = 0;
+                self.in_speech = true;
+            } else if self.in_speech {
+                self.silence += 1;
+            }
+            if !self.in_speech {
+                if self.rms.len() > PRE_ROLL {
+                    self.frames.drain(..FRAME);
+                    self.rms.remove(0);
+                }
+                continue;
+            }
+            if self.silence >= END_SILENCE {
+                let end = self.frames.len() - self.silence.saturating_sub(KEEP_TAIL) * FRAME;
+                let enough = self.speech >= MIN_SPEECH;
+                let utterance = self.frames[..end].to_vec();
+                self.reset();
+                if enough {
+                    out.push(utterance);
+                }
+            } else if self.rms.len() >= MAX_FRAMES {
+                let from = self.rms.len() - CUT_WINDOW;
+                let cut = from
+                    + self.rms[from..]
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| a.1.total_cmp(b.1))
+                        .map_or(0, |(i, _)| i);
+                out.push(self.frames[..cut * FRAME].to_vec());
+                self.frames.drain(..cut * FRAME);
+                self.rms.drain(..cut);
+                self.speech = self.rms.len();
+                self.silence = 0;
+            }
+        }
+        out
+    }
+}
+
+/// Appends a line to the file named by LIVE_SUBTITLE_DEBUG_LOG (diagnostics only).
+fn debug_log(line: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("LIVE_SUBTITLE_DEBUG_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Lifts quiet utterances to a consistent level (whisper degrades on very low-amplitude input).
+fn normalize(mut samples: Vec<f32>) -> Vec<f32> {
+    let peak = samples.iter().fold(0f32, |p, s| p.max(s.abs()));
+    if peak > 1e-4 && peak < 0.3 {
+        let gain = (0.5 / peak).min(40.0);
+        for s in &mut samples {
+            *s *= gain;
+        }
+    }
+    samples
+}
+
+fn is_noise(text: &str) -> bool {
+    text.chars().all(|c| !c.is_alphanumeric())
+        || (text.starts_with('[') && text.ends_with(']'))
+        || (text.starts_with('(') && text.ends_with(')'))
+}
+
+fn run_asr(
+    rx: Receiver<Vec<f32>>,
+    model: &PathBuf,
+    settings: SharedSettings,
+    tx: &Sender<Event>,
+    repaint: &(impl Fn() + Send + Sync + Clone + 'static),
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let ctx = WhisperContext::new_with_params(
+        model.to_str().ok_or("モデルのパスが不正")?,
+        WhisperContextParameters::default(),
+    )
+    .map_err(|e| format!("whisper のモデルを読み込めない: {e}"))?;
+    let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+    let _ = tx.send(Event::Asr(Stage::Ready));
+    repaint();
+
+    let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
+    let mut seg = Segmenter::new();
+    let mut next_id = 0u64;
+    let mut last_text = String::new();
+    let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
+
+    while !stop.load(Ordering::Relaxed) {
+        let chunk = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let level = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt();
+        let _ = tx.send(Event::Level(level));
+        chunks += 1;
+        peak = peak.max(level);
+        if tick.elapsed() >= Duration::from_secs(2) {
+            debug_log(&format!("chunks={chunks} peak_rms={peak:.4} {}", seg.debug()));
+            (chunks, peak, tick) = (0, 0.0, std::time::Instant::now());
+        }
+        for utterance in seg.push(&chunk) {
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_language(Some("auto"));
+            params.set_translate(false);
+            params.set_no_context(true);
+            params.set_suppress_nst(true);
+            params.set_no_speech_thold(0.6);
+            params.set_temperature(0.0);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            let utterance = normalize(utterance);
+            let t0 = std::time::Instant::now();
+            let ok = state.full(params, &utterance).is_ok();
+            debug_log(&format!(
+                "utterance {:.1}s decoded in {:.2}s ok={ok}",
+                utterance.len() as f32 / SAMPLE_RATE as f32,
+                t0.elapsed().as_secs_f32()
+            ));
+            if !ok {
+                continue;
+            }
+            let mut text = String::new();
+            for s in state.as_iter() {
+                if s.no_speech_probability() > 0.6 {
+                    continue;
+                }
+                text.push_str(&format!("{s}"));
+            }
+            let text = text.trim().to_string();
+            if text.is_empty() || is_noise(&text) || (text == last_text && utterance.len() < 2 * SAMPLE_RATE as usize) {
+                continue;
+            }
+            last_text.clone_from(&text);
+            let lang = whisper_rs::get_lang_str(state.full_lang_id_from_state())
+                .unwrap_or("??")
+                .to_string();
+            let id = next_id;
+            next_id += 1;
+            debug_log(&format!("heard [{lang}] {text}"));
+            let _ = tx.send(Event::Heard { id, lang: lang.clone(), text: text.clone() });
+            repaint();
+
+            let ctx_lines: Vec<String> = context.lock().map(|c| c.iter().cloned().collect()).unwrap_or_default();
+            if let Ok(mut c) = context.lock() {
+                c.push_back(text.clone());
+                if c.len() > 3 {
+                    c.pop_front();
+                }
+            }
+            let (tx, settings, repaint) = (tx.clone(), settings.clone(), repaint.clone());
+            std::thread::spawn(move || {
+                let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
+                if s.engine == Engine::Off || lang == "ja" {
+                    return;
+                }
+                let t0 = std::time::Instant::now();
+                let ev = match translate::translate(&s, &text, &lang, &ctx_lines) {
+                    Ok(text) => {
+                        debug_log(&format!("translated in {:.2}s: {text}", t0.elapsed().as_secs_f32()));
+                        Event::Translated { id, text }
+                    }
+                    Err(error) => Event::TranslateFailed { id, error },
+                };
+                let _ = tx.send(ev);
+                repaint();
+            });
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,13 @@
+{
+  "files": {
+    "src/app_shell_foundation.rs": "ed8838f8f39bfb0bcaea2b14d4720d91453f6fbe4bf6ba06978cea64a3dac02a"
+  },
+  "platform": "eframe-egui",
+  "schemaVersion": 1,
+  "sourceDir": "src",
+  "task": {
+    "deliveryMode": "iterative",
+    "id": "live-subtitle-gui"
+  },
+  "templateVersion": "0.4.0"
+}
