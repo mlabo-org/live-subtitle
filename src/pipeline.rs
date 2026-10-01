@@ -38,6 +38,28 @@ pub struct Pipeline {
     stop: Arc<AtomicBool>,
 }
 
+/// The running recognition thread and its stop flag, so the process can wait for it before it exits.
+static ASR: Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>> = Mutex::new(None);
+
+/// Stops the recognition thread and waits (at most a few seconds) until it has freed the whisper model.
+///
+/// The Metal backend frees its device when the process exits and aborts if a model is still alive then, which
+/// showed up as a crash report on every quit. A model that is not freed in time is left to the OS.
+pub fn finish_asr() {
+    let running = ASR.lock().ok().and_then(|mut r| r.take());
+    let Some((stop, handle)) = running else {
+        return;
+    };
+    stop.store(true, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    }
+}
+
 impl Drop for Pipeline {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -85,12 +107,15 @@ impl Pipeline {
         }
 
         let stop_asr = stop.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             if let Err(e) = run_asr(leveled_rx, &model, settings, &tx, &repaint, &stop_asr) {
                 let _ = tx.send(Event::Fatal(e));
                 repaint();
             }
         });
+        if let Ok(mut running) = ASR.lock() {
+            *running = Some((stop.clone(), handle));
+        }
         Ok(Self { _capture: capture, stop })
     }
 }

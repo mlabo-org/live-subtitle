@@ -930,6 +930,8 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // Stop asking Ollama for anything, then free its memory before the process goes away.
         translate::close_ollama();
+        self.pipeline = None;
+        pipeline::finish_asr();
         translate::shutdown();
         let _ = translate::ollama_unload_all();
     }
@@ -953,17 +955,34 @@ impl eframe::App for App {
 
 /// Frees Ollama's memory when the app ends abnormally: on a panic, and on SIGTERM/SIGINT/SIGHUP.
 /// (A crash that gives no chance to run code is covered by the release at the next launch.)
+/// Appends a line to `~/Library/Application Support/LiveSubtitle/crash.log`, so an unexpected end of the app
+/// leaves a trace even when it was started from Finder and nobody saw its stderr.
+fn log_crash_event(text: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home).join("Library/Application Support/LiveSubtitle");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
+        let _ = writeln!(file, "[{}] {text}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    }
+}
+
 fn install_safety_net() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        log_crash_event(&format!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture()));
         let _ = translate::ollama_unload_all();
         previous(info);
     }));
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     if let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
         std::thread::spawn(move || {
-            if signals.forever().next().is_some() {
+            if let Some(signal) = signals.forever().next() {
+                log_crash_event(&format!("received signal {signal}, shutting down"));
                 translate::close_ollama();
+                pipeline::finish_asr();
                 translate::shutdown();
                 let _ = translate::ollama_unload_all();
                 std::process::exit(0);
@@ -972,12 +991,19 @@ fn install_safety_net() {
     }
 }
 
+/// The Dock icon while the app runs. Without this eframe puts its own default icon there.
+fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/window-icon-512.png"))
+        .expect("assets/icon/window-icon-512.png must be a valid PNG")
+}
+
 fn main() -> eframe::Result {
     install_safety_net();
     let options = eframe::NativeOptions {
         // The band changes the window geometry; do not let that become the next launch's normal window.
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
+            .with_icon(window_icon())
             .with_inner_size([680.0, 480.0])
             .with_min_inner_size(NORMAL_MIN_SIZE)
             .with_transparent(true),
