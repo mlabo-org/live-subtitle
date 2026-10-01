@@ -19,6 +19,10 @@ system audio ─ ScreenCaptureKit ─ auto gain ─ utterance ─ whisper.cpp (M
 - The window stays on top by default (toggle available).
 - "帯にする" (make a band) switches to a compact subtitle-only view, like a TV caption: a borderless, translucent strip that opens **centered on where the normal window was, and as wide as it was** (to match a video's width, resize the normal window first). The previous position is deliberately not reused, because a band that reappears at an old position gets lost. For the first 10 seconds its frame blinks yellow so you can find it. Drag it anywhere and drag its edges to resize it (the text scales with the band's height; only the height is remembered). It fades out when nothing is being said and floats over full-screen video as well. **Esc** (or the "元に戻す" restore button that appears on hover) returns to the normal window at its original size and position. Esc works only while the band has focus (click the band to focus it).
 
+## Let an AI agent build it for you
+
+A coding agent such as Codex or Claude Code can build and install the app for you. Open the repository and ask it to "install Live Subtitle following `AGENTS.md`". The agent checks the prerequisites, downloads the whisper model (asking you first), picks a signing identity, builds and swaps in the app, and verifies that it starts. **Granting Screen Recording, signing in, and answering folder-access prompts is left to you** (the agent does not touch System Settings or credentials). It is also required to tell you before it stops a running app.
+
 ## What to prepare in advance
 
 **To build**
@@ -112,6 +116,7 @@ If macOS asks for anything else (folder access and the like), just read the prom
 | Your Mac's sound suddenly got loud while testing | The app never changes the Mac's output volume or the signal sent to your speakers; the automatic gain control touches only the captured copy. The loudness seen during development came from full-level test sounds (`say`, `afplay`), not from the app's gain |
 | You lost the band | For the first 10 seconds its frame blinks yellow. Click the band to focus it, then press Esc or the restore button to return to the normal window. Esc works only while the band has focus |
 | Claude sign-in does not finish | If the browser flow does not complete by itself, run `claude auth login` in a terminal (the Claude sign-in action itself was not verified on the author's Mac) |
+| The app ended unexpectedly | Look at `~/Library/Application Support/LiveSubtitle/crash.log` (panics and termination signals) and at `live-subtitle-*.ips` in `~/Library/Logs/DiagnosticReports/` (macOS crash reports). An exit caused by stopping the app during other work leaves a record too |
 | `codesign` fails | It fails when the build happens inside an iCloud-synced folder such as `~/Desktop`. `scripts/bundle.sh` builds in a temporary directory, so build through the script |
 
 ## Translation backends
@@ -185,6 +190,9 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 - `src/main.rs` GUI
 - `src/app_shell_foundation.rs` shared display-settings component (managed by app-shell-foundation; do not edit)
 - `examples/capture-spike.rs` an audio-capture-only smoke test
+- `scripts/bundle.sh` builds, creates, signs and installs the `.app`
+- `assets/icon/` the app icon (the source picture `source.png`, `AppIcon.icns` for the bundle, and `window-icon-512.png` used while running); rebuilt with `scripts/make-icon.sh`
+- `AGENTS.md` the install procedure and the development rules for coding agents
 
 ## Known limitations
 

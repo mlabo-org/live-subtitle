@@ -21,6 +21,23 @@
 - `CODESIGN_IDENTITY` に固定の署名 ID を渡す。ad-hoc 署名だと、ビルドし直すたびに画面収録の許可が外れる。
 - 通常の実行は、できあがった `.app` を直接開く。`cargo run` は使わない。
 - whisper のモデル（約 574 MB）はリポジトリに入れない。
+- アイコンは `assets/icon/source.png` が元の絵。`scripts/make-icon.sh` で `assets/icon/AppIcon.icns`（`.app` のアイコン）と `assets/icon/window-icon-512.png`（実行中に Dock へ渡すアイコン）を作り直す。後者を `src/main.rs` が `include_bytes!` で読み込んでいる。渡さないと、実行中だけ eframe の既定アイコンになる。
+- アプリを終了するときは、認識のスレッドを先に止めて whisper のモデルを解放してからプロセスを終える（`pipeline::finish_asr`）。モデルが残ったまま終了すると、ggml の Metal の後片付けが `abort` してクラッシュの記録が残る。
+- 予期しない終了（パニック、終了の合図）は `~/Library/Application Support/LiveSubtitle/crash.log` に残る。macOS のクラッシュの記録は `~/Library/Logs/DiagnosticReports/` にある。
+
+## Install Procedure For Agents
+
+ユーザーが「インストールして」「ビルドして」「更新して」と頼んだときの手順。各ステップは、読み取りの確認を先に行い、満たしていれば飛ばす。リポジトリのルートで作業する。
+
+1. **前提の確認（読み取りだけ）**: `sw_vers -productVersion`（13 以上）、`uname -m`（`arm64`）、`xcrun --find swift`、`cargo --version`、`cmake --version`。欠けているものは、ユーザーに報告し、入れてよいか確認してから入れる（`xcode-select --install`、`brew install cmake`、Rust は rustup）。黙って入れない。
+2. **whisper のモデル（約 574 MB のダウンロード）**: `test -f ~/"Library/Application Support/LiveSubtitle/ggml-large-v3-turbo-q5_0.bin"` で確認する。無ければ、ファイル名・取得元（`huggingface.co/ggerganov/whisper.cpp`）・サイズをユーザーに示して許可を得てから、README の `curl` コマンドで取得する。
+3. **署名 ID**: `security find-identity -v -p codesigning` で有効な ID を調べる。1 つならそれを使ってよいかユーザーに確認し、複数なら選んでもらう。無ければ、ad-hoc 署名になり、ビルドし直すたびに画面収録の許可が外れる、とユーザーに伝える。署名 ID を、更新のたびに変えない（許可が外れる）。
+4. **実行中のアプリの扱い**: `pgrep -f "Live Subtitle.app/Contents/MacOS"` で調べる。実行中なら、止める前に**必ずユーザーへ知らせる**（使用中の字幕が消える）。止めるときは `osascript -e 'tell application "Live Subtitle" to quit'` を使う（`pkill` や `kill` は使わない。終了時にモデルのメモリ解放を行う経路を通すため）。
+5. **ビルドとインストール**: `CODESIGN_IDENTITY="<署名 ID>" scripts/bundle.sh`。出力は `~/Applications/Live Subtitle.app`。ビルドは一時ディレクトリで行う。`cargo run` は使わない。失敗したら、README の「つまずいたときは」を見る（iCloud 同期下の `codesign` 失敗、Swift の欠如が多い）。
+6. **起動の確認**: `open ~/Applications/"Live Subtitle.app"` のあと、数秒待って `pgrep -f "Live Subtitle.app/Contents/MacOS"` で動いていることを確かめる。
+7. **翻訳先の準備（ユーザーが使うものだけ）**: Ollama は `curl -s localhost:11434/api/tags` で動作とモデルを確認する。モデルが無ければ、`ollama pull gemma4:26b-mlx` を提案する（約 18 GB のダウンロードなので、許可を得る）。Claude は `claude` コマンド、Codex は `codex` コマンドが在ることの確認だけを行う。
+8. **ユーザーに頼むこと（エージェントは行わない）**: 画面収録とシステムオーディオ録音の許可（システム設定）、Claude／ChatGPT のサインイン（画面のボタン）、フォルダへのアクセスの確認ダイアログ。システム設定を変えない。認証情報を扱わない。サインインのボタンを押さない。許可の手順は README の「macOS の許可」を案内する。
+9. **完了の報告**: インストール先、起動の確認結果、ユーザーに残っている手作業（上の 8）を伝える。ソースの変更だけで、アプリを入れ替えていないときは、そう報告する（ソース・ビルド・入れ替えは別の段階）。
 
 ## High-Risk Boundaries
 
