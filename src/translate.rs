@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::process::ChildStdout;
 use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -165,7 +166,17 @@ fn ollama_agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+/// Set while the app is shutting down: Ollama must not be asked for anything that would load a model again.
+static OLLAMA_CLOSED: AtomicBool = AtomicBool::new(false);
+
+pub fn close_ollama() {
+    OLLAMA_CLOSED.store(true, Ordering::SeqCst);
+}
+
 fn ollama(model: &str, system: &str, text: &str) -> Result<String, String> {
+    if OLLAMA_CLOSED.load(Ordering::SeqCst) {
+        return Err("終了処理中".into());
+    }
     let body = serde_json::json!({
         "model": model,
         "stream": false,
@@ -199,4 +210,197 @@ pub fn ollama_models() -> Vec<String> {
         .as_array()
         .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
         .unwrap_or_default()
+}
+
+/// The models Ollama holds in memory right now. `None` means no server is listening: nothing is loaded,
+/// and an idle server is never started just to ask.
+fn loaded_models(agent: &ureq::Agent, host: &str) -> Result<Option<Vec<String>>, String> {
+    let mut response = match agent.get(&format!("{host}/api/ps")).call() {
+        Ok(response) => response,
+        Err(ureq::Error::ConnectionFailed | ureq::Error::Io(_)) => return Ok(None),
+        Err(e) => return Err(format!("Ollama の状態を取れない: {e}")),
+    };
+    if !response.status().is_success() {
+        return Err(format!("Ollama の状態を取れない: {}", response.status()));
+    }
+    let value: serde_json::Value = response.body_mut().read_json().map_err(|e| e.to_string())?;
+    let mut names: Vec<String> = Vec::new();
+    for model in value["models"].as_array().into_iter().flatten() {
+        if let Some(name) = model["name"].as_str() {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(Some(names))
+}
+
+/// Unloads every model Ollama holds in memory, including ones other apps loaded, and returns how many.
+///
+/// Each loaded model gets `keep_alive: 0` (Ollama's way to unload it), then `/api/ps` is polled until they
+/// are gone. A model somebody else loads in the meantime is reported instead of being chased.
+pub fn ollama_unload_all() -> Result<usize, String> {
+    unload_all_at(&ollama_host())
+}
+
+/// An agent that hands back error statuses as responses, so the server's own reason can be shown.
+fn lenient_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build().into()
+}
+
+fn unload_all_at(host: &str) -> Result<usize, String> {
+    let agent = lenient_agent(Duration::from_secs(10));
+    let Some(loaded) = loaded_models(&agent, host)? else {
+        return Ok(0);
+    };
+    if loaded.is_empty() {
+        return Ok(0);
+    }
+    let mut failures = Vec::new();
+    for model in &loaded {
+        let body = serde_json::json!({ "model": model, "keep_alive": 0, "stream": false });
+        let outcome = agent.post(&format!("{host}/api/generate")).send_json(&body).map_err(|e| e.to_string()).and_then(|mut r| {
+            let status = r.status();
+            let reply = r.body_mut().read_json::<serde_json::Value>().unwrap_or_default();
+            if !status.is_success() {
+                return Err(format!("{status}: {}", reply["error"].as_str().unwrap_or("不明なエラー")));
+            }
+            if reply["done"].as_bool() == Some(true) {
+                Ok(())
+            } else {
+                Err("解放が受け付けられなかった".to_string())
+            }
+        });
+        if let Err(e) = outcome {
+            failures.push(format!("{model}: {e}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("解放できなかったモデルがある: {}", failures.join("; ")));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let running = loaded_models(&agent, host)?.unwrap_or_default();
+        if running.is_empty() {
+            return Ok(loaded.len());
+        }
+        if running.iter().all(|name| !loaded.contains(name)) {
+            return Err(format!("解放中に別のモデルが読み込まれた: {}", running.join(", ")));
+        }
+        if Instant::now() > deadline {
+            return Err("モデルの解放が 30 秒で終わらなかった".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod unload_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    /// A fake Ollama: `/api/ps` lists `loaded`; `/api/generate` with keep_alive 0 removes the model
+    /// (or answers 400 for a model named "stuck"). Every POST body is recorded.
+    struct Fake {
+        host: String,
+        loaded: Arc<Mutex<Vec<String>>>,
+        posts: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    fn fake_ollama(initial: &[&str]) -> Fake {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let loaded = Arc::new(Mutex::new(initial.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let (state, record) = (loaded.clone(), posts.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (state, record) = (state.clone(), record.clone());
+                std::thread::spawn(move || serve(stream, &state, &record));
+            }
+        });
+        Fake { host, loaded, posts }
+    }
+
+    fn serve(mut stream: std::net::TcpStream, loaded: &Mutex<Vec<String>>, posts: &Mutex<Vec<serde_json::Value>>) {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        let (head_end, length) = loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..pos]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                    .unwrap_or(0);
+                break (pos + 4, length);
+            }
+        };
+        while data.len() < head_end + length {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        let request = String::from_utf8_lossy(&data[..head_end]).to_string();
+        let (status, body) = if request.starts_with("GET /api/ps") {
+            let models: Vec<_> = loaded.lock().unwrap().iter().map(|n| serde_json::json!({ "name": n })).collect();
+            ("200 OK", serde_json::json!({ "models": models }))
+        } else {
+            let body: serde_json::Value = serde_json::from_slice(&data[head_end..]).unwrap_or_default();
+            posts.lock().unwrap().push(body.clone());
+            let name = body["model"].as_str().unwrap_or("").to_string();
+            if name == "stuck" {
+                ("400 Bad Request", serde_json::json!({ "error": "cannot unload" }))
+            } else {
+                loaded.lock().unwrap().retain(|n| *n != name);
+                ("200 OK", serde_json::json!({ "done": true }))
+            }
+        };
+        let body = body.to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn unloads_every_loaded_model_with_keep_alive_zero() {
+        let fake = fake_ollama(&["big:55b", "small:7b"]);
+        assert_eq!(unload_all_at(&fake.host), Ok(2));
+        assert!(fake.loaded.lock().unwrap().is_empty());
+        let posts = fake.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        for (post, name) in posts.iter().zip(["big:55b", "small:7b"]) {
+            assert_eq!(*post, serde_json::json!({ "model": name, "keep_alive": 0, "stream": false }));
+        }
+    }
+
+    #[test]
+    fn nothing_loaded_sends_no_unload_request() {
+        let fake = fake_ollama(&[]);
+        assert_eq!(unload_all_at(&fake.host), Ok(0));
+        assert!(fake.posts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_unloaded_is_named_in_the_error() {
+        let fake = fake_ollama(&["ok:1b", "stuck"]);
+        let error = unload_all_at(&fake.host).unwrap_err();
+        assert!(error.contains("stuck") && error.contains("cannot unload"), "{error}");
+    }
+
+    #[test]
+    fn a_server_that_is_not_running_holds_no_models() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert_eq!(unload_all_at(&format!("http://127.0.0.1:{port}")), Ok(0));
+    }
 }

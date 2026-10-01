@@ -113,6 +113,8 @@ struct App {
     codex_auth: Auth,
     auth_tx: Sender<(Engine, Auth)>,
     auth_rx: Receiver<(Engine, Auth)>,
+    notice_tx: Sender<String>,
+    notice_rx: Receiver<String>,
     band: Option<BandState>,
     band_configured: bool,
     last_line_at: Option<Instant>,
@@ -134,6 +136,7 @@ impl App {
         cc.egui_ctx.send_viewport_cmd(level_command(persisted.always_on_top));
         let (tx, rx) = mpsc::channel();
         let (auth_tx, auth_rx) = mpsc::channel();
+        let (notice_tx, notice_rx) = mpsc::channel();
         let autostart = std::env::var_os("LIVE_SUBTITLE_AUTOSTART").is_some();
         let mut app = Self {
             preferences,
@@ -157,12 +160,16 @@ impl App {
             codex_auth: Auth::Unknown,
             auth_tx,
             auth_rx,
+            notice_tx,
+            notice_rx,
             band: None,
             band_configured: false,
             last_line_at: None,
             notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
+        // A crash or a force-quit can leave models in memory; start from a clean slate.
+        app.release_ollama(&cc.egui_ctx, "起動時", false);
         if autostart {
             app.start(&cc.egui_ctx);
         }
@@ -191,6 +198,33 @@ impl App {
             }
             Err(e) => format!("保存できなかった: {e}"),
         });
+    }
+
+    /// Frees every model Ollama holds in memory, in the background. `reason` prefixes the result shown in the
+    /// window; with `warm_up_after` the translation model is loaded again once the memory is free.
+    fn release_ollama(&mut self, ctx: &egui::Context, reason: &'static str, warm_up_after: bool) {
+        let (notice, ctx) = (self.notice_tx.clone(), ctx.clone());
+        let warm = warm_up_after.then(|| (self.shared.clone(), self.tx.clone()));
+        std::thread::spawn(move || {
+            let message = match translate::ollama_unload_all() {
+                Ok(0) if reason == "手動" => "読み込み中の Ollama モデルはありません".to_string(),
+                Ok(0) => String::new(),
+                Ok(n) => format!("{reason}: Ollama のモデルを {n} 個、メモリから解放した"),
+                Err(e) => format!("{reason}: Ollama のモデルを解放できなかった: {e}"),
+            };
+            let _ = notice.send(message);
+            if let Some((settings, tx)) = warm {
+                let repaint_ctx = ctx.clone();
+                pipeline::warm_up(settings, tx, move || repaint_ctx.request_repaint());
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_notices(&mut self) {
+        while let Ok(message) = self.notice_rx.try_recv() {
+            self.notice = (!message.is_empty()).then_some(message);
+        }
     }
 
     fn auth_mut(&mut self, engine: Engine) -> Option<&mut Auth> {
@@ -502,6 +536,13 @@ impl App {
                     if ui.small_button("更新").on_hover_text("Ollama のモデル一覧を取り直す").clicked() {
                         self.ollama_models = translate::ollama_models();
                     }
+                    if ui
+                        .button("メモリ解放")
+                        .on_hover_text("Ollama がメモリに載せている全モデルを解放する（他のアプリが使っているモデルも対象。次に使うとき再読み込みされる）")
+                        .clicked()
+                    {
+                        self.release_ollama(ui.ctx(), "手動", false);
+                    }
                 }
                 Engine::Claude => {
                     let t = &mut self.persisted.translate;
@@ -585,13 +626,22 @@ impl App {
                     }
                     Engine::Off => false,
                 };
-                if self.running() && reload {
+                // Leaving an Ollama model (another model, or another engine) frees its memory first, so two large
+                // models are never resident together; the new model is loaded once the memory is free.
+                let left_ollama_model = before_engine == Engine::Ollama
+                    && (self.persisted.translate.engine != Engine::Ollama
+                        || self.persisted.translate.ollama_model != before_model);
+                let warm_up_now = self.running() && reload;
+                if left_ollama_model {
+                    self.release_ollama(ui.ctx(), "モデル切り替え", warm_up_now);
+                } else if warm_up_now {
                     let ctx = ui.ctx().clone();
                     pipeline::warm_up(self.shared.clone(), self.tx.clone(), move || ctx.request_repaint());
                 }
             }
         });
         self.poll_auth();
+        self.poll_notices();
         let engine = self.persisted.translate.engine;
         if matches!(engine, Engine::Claude | Engine::Codex) {
             let unknown = matches!(engine, Engine::Claude if self.claude_auth == Auth::Unknown)
@@ -841,7 +891,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Stop asking Ollama for anything, then free its memory before the process goes away.
+        translate::close_ollama();
         translate::shutdown();
+        let _ = translate::ollama_unload_all();
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -861,7 +914,29 @@ impl eframe::App for App {
     }
 }
 
+/// Frees Ollama's memory when the app ends abnormally: on a panic, and on SIGTERM/SIGINT/SIGHUP.
+/// (A crash that gives no chance to run code is covered by the release at the next launch.)
+fn install_safety_net() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = translate::ollama_unload_all();
+        previous(info);
+    }));
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+        std::thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                translate::close_ollama();
+                translate::shutdown();
+                let _ = translate::ollama_unload_all();
+                std::process::exit(0);
+            }
+        });
+    }
+}
+
 fn main() -> eframe::Result {
+    install_safety_net();
     let options = eframe::NativeOptions {
         // The band changes the window geometry; do not let that become the next launch's normal window.
         persist_window: false,

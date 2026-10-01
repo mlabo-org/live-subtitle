@@ -17,6 +17,7 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSColor"] }
 raw-window-handle = "0.6"
 rfd = "0.17"
+signal-hook = "0.3"
 
 [profile.release]
 opt-level = 3
