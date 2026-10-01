@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext, WhisperVadContextParams,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -146,114 +148,157 @@ pub fn warm_up(
     });
 }
 
-/// System audio often arrives quiet, so the absolute floor for "voiced" is low and the real test is relative.
-const MIN_VOICED_RMS: f32 = 0.0025;
-const FRAME: usize = SAMPLE_RATE as usize / 50; // 20 ms
-const PRE_ROLL: usize = 15; // 300 ms kept before the first voiced frame
-const END_SILENCE: usize = 25; // 500 ms of quiet ends an utterance
-const KEEP_TAIL: usize = 10; // quiet frames kept at the end of an utterance
-const MIN_SPEECH: usize = 15; // shorter bursts are noise
-const MAX_FRAMES: usize = 500; // 10 s hard cap so continuous audio still produces subtitles
-const CUT_WINDOW: usize = 150; // the cap cuts at the quietest frame within the last 3 s
-const FLOOR_FALL: f32 = 0.2; // the floor drops to a quieter frame within a few frames
-const FLOOR_RISE: f32 = 0.002; // and creeps up toward a louder level over about ten seconds
+/// Silero VAD judges speech in windows of this many samples (32 ms).
+const WINDOW: usize = 512;
+const HOP: usize = 4; // windows judged per run of the detector (128 ms)
+/// Earlier windows handed to the detector on every run. It starts each run from a blank state, and with less
+/// than about two seconds behind the new windows it takes music for speech more often.
+const CONTEXT: usize = 62;
+const SPEECH_PROBABILITY: f32 = 0.5;
+const PRE_ROLL: usize = 9; // about 300 ms kept before the first window with speech
+const END_SILENCE: usize = 16; // about 500 ms without speech ends an utterance
+const KEEP_TAIL: usize = 6; // windows without speech kept at the end of an utterance
+const MIN_SPEECH: usize = 9; // shorter bursts are noise
+const MAX_WINDOWS: usize = 312; // 10 s hard cap so continuous speech still produces subtitles
+const CUT_WINDOW: usize = 94; // the cap cuts at the least speech-like window within the last 3 s
 
-/// Energy-based utterance segmenter.
+/// The detector's model (885 KB) travels inside the app. whisper.cpp loads it from a file, so it is written
+/// next to the whisper model on first use.
+const VAD_MODEL: &[u8] = include_bytes!("../assets/vad/ggml-silero-v5.1.2.bin");
+
+fn vad_model_file() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME が無い")?;
+    let dir = home.join("Library/Application Support/LiveSubtitle");
+    let file = dir.join("ggml-silero-v5.1.2.bin");
+    if std::fs::metadata(&file).map(|m| m.len()).ok() != Some(VAD_MODEL.len() as u64) {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作れない: {e}", dir.display()))?;
+        let partial = dir.join(format!("ggml-silero-v5.1.2.bin.{}", std::process::id()));
+        std::fs::write(&partial, VAD_MODEL)
+            .and_then(|()| std::fs::rename(&partial, &file))
+            .map_err(|e| format!("音声検出のモデルを書き出せない: {e}"))?;
+    }
+    Ok(file)
+}
+
+/// Utterance segmenter.
 ///
-/// Voice activity is judged on the raw signal; the audio kept for whisper is the AGC-leveled twin.
+/// A voice activity detector (Silero VAD, run by whisper.cpp) says which windows hold speech, so wind, a
+/// crowd or music are not taken for an utterance however loud they are. The windows are stitched into
+/// utterances here. The detector hears the AGC-leveled audio, the same audio whisper gets: on the quiet
+/// signal the Mac hands over it misses speech.
 struct Segmenter {
+    vad: WhisperVadContext,
+    /// Audio not judged yet (less than `HOP` windows).
     carry: Vec<f32>,
-    carry_leveled: Vec<f32>,
+    /// The last `CONTEXT` windows that were judged.
+    context: Vec<f32>,
     frames: Vec<f32>,
-    rms: Vec<f32>,
+    /// The detector's speech probability for each window in `frames`.
+    probabilities: Vec<f32>,
     in_speech: bool,
     speech: usize,
     silence: usize,
-    floor: f32,
 }
 
 impl Segmenter {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self, String> {
+        let model = vad_model_file()?;
+        // One thread: the model is tiny, and with the default four the workers spend more CPU time waiting on
+        // each other than the single thread needs for the whole job.
+        let mut params = WhisperVadContextParams::default();
+        params.set_n_threads(1);
+        let vad = WhisperVadContext::new(model.to_str().ok_or("モデルのパスが不正")?, params)
+            .map_err(|e| format!("音声検出のモデルを読み込めない: {e}"))?;
+        Ok(Self {
+            vad,
             carry: Vec::new(),
-            carry_leveled: Vec::new(),
+            context: Vec::new(),
             frames: Vec::new(),
-            rms: Vec::new(),
+            probabilities: Vec::new(),
             in_speech: false,
             speech: 0,
             silence: 0,
-            floor: 0.002,
-        }
+        })
     }
 
     fn debug(&self) -> String {
         format!(
-            "in_speech={} speech={} silence={} frames={} floor={:.4}",
-            self.in_speech, self.speech, self.silence, self.rms.len(), self.floor
+            "in_speech={} speech={} silence={} windows={} speech_probability={:.2}",
+            self.in_speech,
+            self.speech,
+            self.silence,
+            self.probabilities.len(),
+            self.probabilities.last().copied().unwrap_or(0.0)
         )
     }
 
     fn reset(&mut self) {
         self.frames.clear();
-        self.rms.clear();
+        self.probabilities.clear();
         self.in_speech = false;
         self.speech = 0;
         self.silence = 0;
     }
 
-    fn push(&mut self, raw: &[f32], leveled: &[f32]) -> Vec<Vec<f32>> {
-        self.carry.extend_from_slice(raw);
-        self.carry_leveled.extend_from_slice(leveled);
+    /// Takes leveled audio as it arrives and returns the utterances that ended in it.
+    fn push(&mut self, leveled: &[f32]) -> Result<Vec<Vec<f32>>, String> {
+        self.carry.extend_from_slice(leveled);
         let mut out = Vec::new();
-        while self.carry.len() >= FRAME {
-            let raw_frame: Vec<f32> = self.carry.drain(..FRAME).collect();
-            let frame: Vec<f32> = self.carry_leveled.drain(..FRAME).collect();
-            let e = (raw_frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
-            let voiced = e > (self.floor * 2.5).max(MIN_VOICED_RMS);
-            // The floor follows the quietest recent level: the background between words. Averaging every
-            // unvoiced frame instead lets speech that is only a little above a steady background (wind, a
-            // crowd, music) pull the floor up to its own level, after which nothing counts as voiced.
-            self.floor += (e - self.floor) * if e < self.floor { FLOOR_FALL } else { FLOOR_RISE };
-            self.frames.extend_from_slice(&frame);
-            self.rms.push(e);
-            if voiced {
-                self.speech += 1;
-                self.silence = 0;
-                self.in_speech = true;
-            } else if self.in_speech {
-                self.silence += 1;
-            }
-            if !self.in_speech {
-                if self.rms.len() > PRE_ROLL {
-                    self.frames.drain(..FRAME);
-                    self.rms.remove(0);
-                }
-                continue;
-            }
-            if self.silence >= END_SILENCE {
-                let end = self.frames.len() - self.silence.saturating_sub(KEEP_TAIL) * FRAME;
-                let enough = self.speech >= MIN_SPEECH;
-                let utterance = self.frames[..end].to_vec();
-                self.reset();
-                if enough {
-                    out.push(utterance);
-                }
-            } else if self.rms.len() >= MAX_FRAMES {
-                let from = self.rms.len() - CUT_WINDOW;
-                let cut = from
-                    + self.rms[from..]
-                        .iter()
-                        .enumerate()
-                        .min_by(|a, b| a.1.total_cmp(b.1))
-                        .map_or(0, |(i, _)| i);
-                out.push(self.frames[..cut * FRAME].to_vec());
-                self.frames.drain(..cut * FRAME);
-                self.rms.drain(..cut);
-                self.speech = self.rms.len();
-                self.silence = 0;
+        while self.carry.len() >= HOP * WINDOW {
+            let fresh: Vec<f32> = self.carry.drain(..HOP * WINDOW).collect();
+            let behind = self.context.len() / WINDOW;
+            self.context.extend_from_slice(&fresh);
+            self.vad.detect_speech(&self.context).map_err(|e| format!("音声検出に失敗: {e}"))?;
+            let judged: Vec<f32> =
+                self.vad.probabilities().get(behind..behind + HOP).ok_or("音声検出の結果が足りない")?.to_vec();
+            let excess = self.context.len().saturating_sub(CONTEXT * WINDOW);
+            self.context.drain(..excess);
+            for (window, probability) in fresh.chunks_exact(WINDOW).zip(judged) {
+                self.step(window, probability, &mut out);
             }
         }
-        out
+        Ok(out)
+    }
+
+    fn step(&mut self, window: &[f32], probability: f32, out: &mut Vec<Vec<f32>>) {
+        self.frames.extend_from_slice(window);
+        self.probabilities.push(probability);
+        if probability > SPEECH_PROBABILITY {
+            self.speech += 1;
+            self.silence = 0;
+            self.in_speech = true;
+        } else if self.in_speech {
+            self.silence += 1;
+        }
+        if !self.in_speech {
+            if self.probabilities.len() > PRE_ROLL {
+                self.frames.drain(..WINDOW);
+                self.probabilities.remove(0);
+            }
+            return;
+        }
+        if self.silence >= END_SILENCE {
+            let end = self.frames.len() - self.silence.saturating_sub(KEEP_TAIL) * WINDOW;
+            let enough = self.speech >= MIN_SPEECH;
+            let utterance = self.frames[..end].to_vec();
+            self.reset();
+            if enough {
+                out.push(utterance);
+            }
+        } else if self.probabilities.len() >= MAX_WINDOWS {
+            let from = self.probabilities.len() - CUT_WINDOW;
+            let cut = from
+                + self.probabilities[from..]
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1.total_cmp(b.1))
+                    .map_or(0, |(i, _)| i);
+            out.push(self.frames[..cut * WINDOW].to_vec());
+            self.frames.drain(..cut * WINDOW);
+            self.probabilities.drain(..cut);
+            self.speech = self.probabilities.len();
+            self.silence = 0;
+        }
     }
 }
 
@@ -276,7 +321,7 @@ fn is_noise(text: &str) -> bool {
 /// Applies AGC to every captured chunk as it arrives and reports the level for the meter.
 fn run_leveler(
     rx: Receiver<Vec<f32>>,
-    out: Sender<(Vec<f32>, Vec<f32>)>,
+    out: Sender<Vec<f32>>,
     tx: &Sender<Event>,
     repaint: &(impl Fn() + Send + Sync),
     stop: &AtomicBool,
@@ -286,12 +331,11 @@ fn run_leveler(
     let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
     let (mut meter_peak, mut meter_tick) = (0f32, std::time::Instant::now());
     while !stop.load(Ordering::Relaxed) {
-        let raw = match rx.recv_timeout(Duration::from_millis(200)) {
+        let mut leveled = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut leveled = raw.clone();
         let rms = agc.process(&mut leveled);
         meter_peak = meter_peak.max(rms);
         if meter_tick.elapsed() >= METER_INTERVAL {
@@ -307,14 +351,14 @@ fn run_leveler(
             debug_log(&format!("chunks={chunks} leveled_peak_rms={peak:.4} agc_gain={:.1}dB", agc.gain_db()));
             (chunks, peak, tick) = (0, 0.0, std::time::Instant::now());
         }
-        if out.send((raw, leveled)).is_err() {
+        if out.send(leveled).is_err() {
             break;
         }
     }
 }
 
 fn run_asr(
-    rx: Receiver<(Vec<f32>, Vec<f32>)>,
+    rx: Receiver<Vec<f32>>,
     model: &PathBuf,
     settings: SharedSettings,
     tx: &Sender<Event>,
@@ -324,6 +368,8 @@ fn run_asr(
     // whisper-rs switches flash attention off by default; whisper.cpp itself has it on, and it is faster on Metal.
     let mut context_params = WhisperContextParameters::default();
     context_params.flash_attn(true);
+    // whisper.cpp reports every detector run and every decode on stderr; nothing reads it.
+    whisper_rs::install_logging_hooks();
     let ctx = WhisperContext::new_with_params(model.to_str().ok_or("モデルのパスが不正")?, context_params)
         .map_err(|e| format!("whisper のモデルを読み込めない: {e}"))?;
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
@@ -331,12 +377,12 @@ fn run_asr(
     repaint();
 
     let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
-    let mut seg = Segmenter::new();
+    let mut seg = Segmenter::new()?;
     let mut last_text = String::new();
     let mut tick = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        let (raw, leveled) = match rx.recv_timeout(Duration::from_millis(200)) {
+        let leveled = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -345,7 +391,7 @@ fn run_asr(
             debug_log(&seg.debug());
             tick = std::time::Instant::now();
         }
-        for utterance in seg.push(&raw, &leveled) {
+        for utterance in seg.push(&leveled)? {
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some("auto"));
             params.set_translate(false);
@@ -420,43 +466,30 @@ fn run_asr(
 mod segmenter_tests {
     use super::*;
 
-    /// One 20 ms frame of noise at the given RMS (a deterministic generator, so the test is repeatable).
-    fn frame(rms: f32, seed: &mut u32) -> Vec<f32> {
-        (0..FRAME)
-            .map(|_| {
-                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                ((*seed >> 8) as f32 / 8_388_608.0 - 1.0) * rms * 1.732
-            })
-            .collect()
-    }
-
-    /// Speech over a background that never goes quiet (wind, a crowd, music): two seconds of speech every
-    /// three seconds, about three times as loud as the background, which itself swells and fades.
+    /// Twenty seconds of sound without a voice must not reach whisper, however loud it is: gusty wind
+    /// (low-passed noise that swells), and plain noise.
     #[test]
-    fn speech_over_a_steady_background_is_still_split_into_utterances() {
-        let mut seg = Segmenter::new();
-        let mut seed = 7;
-        let mut heard = Vec::new(); // start and end of each utterance, in frames
-        let total = 50 * 90;
-        for t in 0..total {
-            let seconds = t as f32 / 50.0;
-            let background = 0.006 + 0.003 * (seconds * 0.3 * std::f32::consts::TAU).sin();
-            let speaking = seconds % 3.0 < 2.0;
-            let syllable = 0.5 + 0.5 * (seconds * 4.0 * std::f32::consts::TAU).sin().abs();
-            let level = if speaking { background + 0.02 * syllable } else { background };
-            let chunk = frame(level, &mut seed);
-            for utterance in seg.push(&chunk, &chunk) {
-                heard.push((t as i64 - (utterance.len() / FRAME) as i64, t as i64));
+    fn loud_sound_without_a_voice_is_not_an_utterance() {
+        for gusty in [true, false] {
+            let mut seg = Segmenter::new().unwrap();
+            let (mut seed, mut low) = (7u32, 0f32);
+            let mut utterances = 0;
+            for t in 0..(SAMPLE_RATE as usize * 20 / 320) {
+                let chunk: Vec<f32> = (0..320)
+                    .map(|i| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let white = (seed >> 8) as f32 / 8_388_608.0 - 1.0;
+                        if !gusty {
+                            return white * 0.17;
+                        }
+                        low = low * 0.97 + white * 0.03;
+                        let seconds = (t * 320 + i) as f32 / SAMPLE_RATE as f32;
+                        low * if seconds % 4.0 < 1.5 { 4.0 } else { 0.8 }
+                    })
+                    .collect();
+                utterances += seg.push(&chunk).unwrap().len();
             }
+            assert_eq!(utterances, 0, "gusty={gusty}");
         }
-        // A floor that drifts up to the level of the speech stops hearing it after some fifteen seconds, so
-        // the stretches of speech after the first half minute are the ones that must still reach whisper.
-        let missed = (10..29)
-            .filter(|n| {
-                let (from, to) = (n * 150, n * 150 + 100);
-                !heard.iter().any(|(a, b)| *a < to - 25 && *b > from + 25)
-            })
-            .count();
-        assert_eq!(missed, 0, "utterances: {heard:?}");
     }
 }

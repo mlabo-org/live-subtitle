@@ -20,7 +20,7 @@
 - ビルドとアプリ化は `scripts/bundle.sh` だけで行う。ビルドは一時ディレクトリで行い、作業ツリーに `target/` を作らない。エディタの解析が作った `target/` は、コミットや引き渡しの前に消す。
 - `CODESIGN_IDENTITY` に固定の署名 ID を渡す。ad-hoc 署名だと、ビルドし直すたびに画面収録の許可が外れる。
 - 通常の実行は、できあがった `.app` を直接開く。`cargo run` は使わない。
-- whisper のモデル（約 574 MB）はリポジトリに入れない。
+- whisper のモデル（約 574 MB）はリポジトリに入れない。音声検出のモデル（`assets/vad/ggml-silero-v5.1.2.bin`、885 KB）はリポジトリに入れてあり、`src/pipeline.rs` が `include_bytes!` で埋め込んで、初回に `~/Library/Application Support/LiveSubtitle/` へ書き出す。
 - アイコンは `assets/icon/source.png` が元の絵。`scripts/make-icon.sh` で `assets/icon/AppIcon.icns`（`.app` のアイコン）と `assets/icon/window-icon-512.png`（実行中に Dock へ渡すアイコン）を作り直す。後者を `src/main.rs` が `include_bytes!` で読み込んでいる。渡さないと、実行中だけ eframe の既定アイコンになる。
 - アプリを終了するときは、認識のスレッドを先に止めて whisper のモデルを解放してからプロセスを終える（`pipeline::finish_asr`）。モデルが残ったまま終了すると、ggml の Metal の後片付けが `abort` してクラッシュの記録が残る。
 - 予期しない終了（パニック、終了の合図）は `~/Library/Application Support/LiveSubtitle/crash.log` に残る。macOS のクラッシュの記録は `~/Library/Logs/DiagnosticReports/` にある。
@@ -42,7 +42,7 @@
 ## High-Risk Boundaries
 
 - 画面収録の許可（TCC）は、ユーザーがシステム設定で付ける。署名を変えたあとに拒否される場合は、一覧の項目を削除して登録し直してもらう。こちらから設定を変えない。
-- 取得した音声の音量は小さい（RMS 約 0.005）。whisper に渡す音は `src/agc.rs` の自動音量補正で持ち上げ、発話の判定は補正前の信号への相対しきい値で行う。固定の絶対しきい値を入れたり、補正前の信号を whisper に直接渡したりすると、字幕が出なくなる。
+- 取得した音声の音量は小さい（RMS 約 0.005）。whisper に渡す音は `src/agc.rs` の自動音量補正で持ち上げる。発話の判定は、音量ではなく音声検出モデル（Silero VAD。`assets/vad/` にあり、アプリに埋め込む）が、同じ補正後の音に対して行う。補正前の信号を whisper や音声検出に直接渡すと、声を取りこぼして字幕が出なくなる。音量のしきい値による発話の判定に戻さない（背景音が続く動画で、声が拾われなくなった）。
 
 - 増幅（自動音量補正を含む）は、取り込んだ音声の複製にアプリの内部でだけ掛ける。システムの出力音量、出力デバイス、ユーザーのスピーカーやヘッドホンへの信号には触れない。音量設定の API や音の出力を、このアプリに入れない。
 - 動作確認でスピーカーから音を出す（`say`、`afplay` など）ときは、先にユーザーへ断る。テスト音はフルレベルで、動画の音よりずっと大きく聞こえる。

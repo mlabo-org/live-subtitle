@@ -7,8 +7,7 @@ A macOS GUI tool (Rust, eframe/egui) that listens to everything your Mac plays (
 ```
 system audio ─ ScreenCaptureKit ─ auto gain ─ utterance ─ whisper.cpp (Metal) ─ translation ─ subtitles
                  16 kHz mono        (AGC)      splitting    language auto-detect   Ollama / Claude / Codex
-                                              (relative
-                                               threshold)
+                                              (Silero VAD)
 ```
 
 - The original text appears immediately; the Japanese translation is filled in as soon as it is ready, so a slow translation never stalls the subtitles.
@@ -183,7 +182,8 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 - `src/capture.rs` system audio capture (ScreenCaptureKit; the app's own sound is excluded)
 - `src/agc.rs` automatic gain control (fast attack, slow release envelope)
 - `src/history.rs` saving the conversation to a file (only when the button is pressed)
-- `src/pipeline.rs` utterance splitting (relative threshold, forced split at 10 s), whisper, translation threads
+- `src/pipeline.rs` utterance splitting (Silero VAD finds the speech, forced split at 10 s), whisper, translation threads
+- `assets/vad/` the voice activity detection model (embedded in the app)
 - `src/translate.rs` backend switching and Ollama
 - `src/claude.rs` translation through a resident Claude CLI
 - `src/codex.rs` translation through a resident Codex App Server
@@ -196,9 +196,11 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 
 ## Known limitations
 
-- On this Mac the captured audio is quite quiet (RMS about 0.005); the cause is unknown. Automatic gain control (AGC: target about -20 dBFS, at most +36 dB, gain held during silence) lifts it before whisper. Utterance splitting uses a threshold relative to the signal before the gain.
-- Music or ambient sound alone is still handed to whisper every 10 seconds. Hallucinated speech is suppressed by the no-speech probability and by dropping symbol-only results, but not perfectly.
+- On this Mac the captured audio is quite quiet (RMS about 0.005); the cause is unknown. Automatic gain control (AGC: target about -20 dBFS, at most +36 dB, gain held during silence) lifts it before whisper. Utterance splitting does not go by loudness: a voice activity detection model (Silero VAD) finds the speech in the same gain-corrected audio. Loud ambient sound such as wind or a crowd is not treated as speech.
+- Stretches without a voice are not handed to whisper, but the voice activity detection can take music for speech (even without singing). The hallucinated speech that follows is suppressed by the no-speech probability and by dropping symbol-only results, but not perfectly.
 
 ## License
 
 [MIT](LICENSE)
+
+The bundled voice activity detection model (`assets/vad/ggml-silero-v5.1.2.bin`) is [Silero VAD](https://github.com/snakers4/silero-vad) (MIT License) in whisper.cpp's format, taken from [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad).

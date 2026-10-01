@@ -6,7 +6,7 @@ Mac で鳴っているすべての音声（YouTube・X・会議など、アプ�
 
 ```
 システム音声 ─ ScreenCaptureKit ─ 自動音量補正 ─ 発話の区切り検出 ─ whisper.cpp (Metal) ─ 翻訳 ─ 字幕
-                 16 kHz mono       (AGC)          相対しきい値      言語自動判定      Ollama / Claude / Codex
+                 16 kHz mono       (AGC)          Silero VAD        言語自動判定      Ollama / Claude / Codex
 ```
 
 - 原文はすぐ表示し、日本語訳は完成し次第あとから差し込む（翻訳が遅くても字幕は止まらない）。
@@ -182,7 +182,8 @@ Ollama が起動していなければ、起動はしない（載っているモ�
 - `src/capture.rs` システム音声の取得（ScreenCaptureKit、自アプリの音は除外）
 - `src/agc.rs` 自動音量補正（速く立ち上がり、ゆっくり戻る包絡線）
 - `src/history.rs` 会話履歴のファイル保存（ボタンを押したときだけ）
-- `src/pipeline.rs` 区切り検出（相対しきい値・最大 10 秒で強制分割）、whisper、翻訳スレッド
+- `src/pipeline.rs` 区切り検出（Silero VAD で声の区間を判定・最大 10 秒で強制分割）、whisper、翻訳スレッド
+- `assets/vad/` 音声検出のモデル（アプリに埋め込む）
 - `src/translate.rs` 翻訳先の切り替えと Ollama
 - `src/claude.rs` 常駐した Claude CLI での翻訳
 - `src/codex.rs` 常駐した Codex App Server での翻訳
@@ -195,9 +196,11 @@ Ollama が起動していなければ、起動はしない（載っているモ�
 
 ## 既知の制約
 
-- このMacでは、取得した音声の音量がかなり小さい（RMS 約 0.005）。原因は未特定。自動音量補正（AGC。目標は約 -20 dBFS、最大 +36 dB、無音の間はゲインを固定）で持ち上げて whisper に渡す。区切り検出は、補正前の信号に対する相対しきい値で行う。
-- 音楽や環境音しかない区間でも、10 秒ごとに whisper へ渡す。幻聴（存在しない発話の出力）は、無音確率と記号だけの結果の除外で抑えているが、完全ではない。
+- このMacでは、取得した音声の音量がかなり小さい（RMS 約 0.005）。原因は未特定。自動音量補正（AGC。目標は約 -20 dBFS、最大 +36 dB、無音の間はゲインを固定）で持ち上げて whisper に渡す。区切り検出は、音量ではなく音声検出モデル（Silero VAD）で、同じ補正後の音から声の区間を判定する。風や人混みのような大きな環境音は、声として扱わない。
+- 声のない区間は whisper へ渡さないが、音声検出は音楽を声と取り違えることがある（歌でなくても起きる）。そのときの幻聴（存在しない発話の出力）は、無音確率と記号だけの結果の除外で抑えているが、完全ではない。
 
 ## ライセンス
 
 [MIT](LICENSE)
+
+同梱している音声検出のモデル（`assets/vad/ggml-silero-v5.1.2.bin`）は、[Silero VAD](https://github.com/snakers4/silero-vad)（MIT ライセンス）を whisper.cpp 用の形式にしたもので、[ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad) から取得した。
