@@ -109,6 +109,7 @@ struct App {
     gain_db: f32,
     error: Option<String>,
     ollama_models: Vec<String>,
+    ollama_models_rx: Option<Receiver<Vec<String>>>,
     /// Text being typed into the Claude model field; committed on Enter or when focus leaves.
     claude_model_edit: String,
     codex_models: Vec<codex::ModelInfo>,
@@ -122,6 +123,8 @@ struct App {
     notice_rx: Receiver<String>,
     band: Option<BandState>,
     band_configured: bool,
+    /// Whether the level meter is on screen (not in the band); the pipeline reports levels only then.
+    meter_shown: Arc<std::sync::atomic::AtomicBool>,
     last_line_at: Option<Instant>,
     auto_band: bool,
     /// One-line result of the last "save conversation" press.
@@ -156,7 +159,8 @@ impl App {
             level: 0.0,
             gain_db: 0.0,
             error: None,
-            ollama_models: translate::ollama_models(),
+            ollama_models: Vec::new(),
+            ollama_models_rx: None,
             claude_model_edit: String::new(),
             codex_models: Vec::new(),
             codex_models_rx: None,
@@ -170,12 +174,14 @@ impl App {
             band: None,
             // true on purpose: the first frame applies the ordinary (opaque) window traits.
             band_configured: true,
+            meter_shown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             last_line_at: None,
             notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
         // A crash or a force-quit can leave models in memory; start from a clean slate.
         app.release_ollama(&cc.egui_ctx, "起動時", false);
+        app.fetch_ollama_models(&cc.egui_ctx);
         if autostart {
             app.start(&cc.egui_ctx);
         }
@@ -325,6 +331,34 @@ impl App {
         });
     }
 
+    /// Asks Ollama for its model list in the background, so a server that does not answer cannot freeze the window.
+    fn fetch_ollama_models(&mut self, ctx: &egui::Context) {
+        if self.ollama_models_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.ollama_models_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(translate::ollama_models());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_ollama_models(&mut self) {
+        let Some(rx) = &self.ollama_models_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(models) => {
+                self.ollama_models = models;
+                self.ollama_models_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.ollama_models_rx = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     fn fetch_codex_models(&mut self, ctx: &egui::Context) {
         if self.codex_models_rx.is_some() {
             return;
@@ -362,7 +396,7 @@ impl App {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         };
-        match Pipeline::start(self.shared.clone(), self.tx.clone(), repaint) {
+        match Pipeline::start(self.shared.clone(), self.tx.clone(), repaint, self.meter_shown.clone()) {
             Ok(p) => self.pipeline = Some(p),
             Err(e) => self.error = Some(e),
         }
@@ -512,6 +546,7 @@ impl App {
             let before_claude = self.persisted.translate.claude_model.clone();
             let before_codex = (self.persisted.translate.codex_model.clone(), self.persisted.translate.codex_effort.clone());
             self.poll_codex_models();
+            self.poll_ollama_models();
             if self.persisted.translate.engine == Engine::Codex && !self.codex_models_tried {
                 self.fetch_codex_models(ui.ctx());
             }
@@ -540,7 +575,7 @@ impl App {
                             }
                         });
                     if ui.small_button("更新").on_hover_text("Ollama のモデル一覧を取り直す").clicked() {
-                        self.ollama_models = translate::ollama_models();
+                        self.fetch_ollama_models(ui.ctx());
                     }
                     if ui
                         .button("メモリ解放")
@@ -721,6 +756,7 @@ impl App {
             passthrough: false,
             started: Instant::now(),
         });
+        self.meter_shown.store(false, std::sync::atomic::Ordering::Relaxed);
         use egui::ViewportCommand as Cmd;
         for cmd in [
             Cmd::Decorations(false),
@@ -740,6 +776,7 @@ impl App {
         let Some(band) = self.band.take() else {
             return;
         };
+        self.meter_shown.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
             self.persisted.band_height = Some(rect.height());
         }

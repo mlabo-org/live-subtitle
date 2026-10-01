@@ -5,7 +5,7 @@ use crate::capture::{Capture, SAMPLE_RATE};
 use crate::translate::{self, Engine, TranslateSettings};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +32,13 @@ pub enum Event {
 }
 
 pub type SharedSettings = Arc<Mutex<TranslateSettings>>;
+
+/// Subtitle ids keep counting across stop and start: the lines of an earlier run stay on screen, and a late
+/// translation must not land on a newer line that was given the same id.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The level meter is fed at most this often; captured chunks arrive faster than a meter can show.
+const METER_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct Pipeline {
     _capture: Capture,
@@ -75,10 +82,13 @@ pub fn model_path() -> PathBuf {
 }
 
 impl Pipeline {
+    /// `meter` says whether the level meter is on screen; while it is not, no level is reported and the window
+    /// is not redrawn for it.
     pub fn start(
         settings: SharedSettings,
         tx: Sender<Event>,
         repaint: impl Fn() + Send + Sync + Clone + 'static,
+        meter: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let model = model_path();
         if !model.is_file() {
@@ -103,7 +113,7 @@ impl Pipeline {
         let (leveled_tx, leveled_rx) = mpsc::channel();
         {
             let (tx, repaint, stop) = (tx.clone(), repaint.clone(), stop.clone());
-            std::thread::spawn(move || run_leveler(audio_rx, leveled_tx, &tx, &repaint, &stop));
+            std::thread::spawn(move || run_leveler(audio_rx, leveled_tx, &tx, &repaint, &stop, &meter));
         }
 
         let stop_asr = stop.clone();
@@ -267,9 +277,11 @@ fn run_leveler(
     tx: &Sender<Event>,
     repaint: &(impl Fn() + Send + Sync),
     stop: &AtomicBool,
+    meter: &AtomicBool,
 ) {
     let mut agc = Agc::new();
     let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
+    let (mut meter_peak, mut meter_tick) = (0f32, std::time::Instant::now());
     while !stop.load(Ordering::Relaxed) {
         let raw = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
@@ -278,8 +290,14 @@ fn run_leveler(
         };
         let mut leveled = raw.clone();
         let rms = agc.process(&mut leveled);
-        let _ = tx.send(Event::Level { rms, gain_db: agc.gain_db() });
-        repaint();
+        meter_peak = meter_peak.max(rms);
+        if meter_tick.elapsed() >= METER_INTERVAL {
+            if meter.load(Ordering::Relaxed) {
+                let _ = tx.send(Event::Level { rms: meter_peak, gain_db: agc.gain_db() });
+                repaint();
+            }
+            (meter_peak, meter_tick) = (0.0, std::time::Instant::now());
+        }
         chunks += 1;
         peak = peak.max(rms);
         if tick.elapsed() >= Duration::from_secs(2) {
@@ -311,7 +329,6 @@ fn run_asr(
 
     let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
     let mut seg = Segmenter::new();
-    let mut next_id = 0u64;
     let mut last_text = String::new();
     let mut tick = std::time::Instant::now();
 
@@ -362,8 +379,7 @@ fn run_asr(
             let lang = whisper_rs::get_lang_str(state.full_lang_id_from_state())
                 .unwrap_or("??")
                 .to_string();
-            let id = next_id;
-            next_id += 1;
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             debug_log(&format!("heard [{lang}] {text}"));
             let _ = tx.send(Event::Heard { id, lang: lang.clone(), text: text.clone() });
             repaint();
