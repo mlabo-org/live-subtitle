@@ -52,9 +52,10 @@ pub struct TranslateSettings {
     pub engine: Engine,
     pub ollama_model: String,
     pub claude_model: String,
-    /// A model id from Codex's `model/list`; the account's default model is `gpt-6.1-sol`.
+    /// A model id from Codex's `model/list`. The default is a light model: translation takes seconds with any
+    /// of them, and the heavier ones take longer.
     pub codex_model: String,
-    /// Reasoning effort for Codex; empty means the model's own default.
+    /// Reasoning effort for Codex; empty means the model's own default (chosen as "既定" in the window).
     pub codex_effort: String,
 }
 
@@ -64,8 +65,8 @@ impl Default for TranslateSettings {
             engine: Engine::Ollama,
             ollama_model: "gemma4:26b-mlx".into(),
             claude_model: CLAUDE_MODELS[0].0.into(),
-            codex_model: "gpt-6.1-sol".into(),
-            codex_effort: String::new(),
+            codex_model: "gpt-5.6-luna".into(),
+            codex_effort: "low".into(),
         }
     }
 }
