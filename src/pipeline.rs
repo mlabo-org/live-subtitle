@@ -77,9 +77,16 @@ impl Pipeline {
             let _ = tx.send(Event::Translator(Stage::Idle));
         }
 
+        // The leveler runs apart from whisper so the meter keeps moving while a decode is in progress.
+        let (leveled_tx, leveled_rx) = mpsc::channel();
+        {
+            let (tx, repaint, stop) = (tx.clone(), repaint.clone(), stop.clone());
+            std::thread::spawn(move || run_leveler(audio_rx, leveled_tx, &tx, &repaint, &stop));
+        }
+
         let stop_asr = stop.clone();
         std::thread::spawn(move || {
-            if let Err(e) = run_asr(audio_rx, &model, settings, &tx, &repaint, &stop_asr) {
+            if let Err(e) = run_asr(leveled_rx, &model, settings, &tx, &repaint, &stop_asr) {
                 let _ = tx.send(Event::Fatal(e));
                 repaint();
             }
@@ -228,8 +235,40 @@ fn is_noise(text: &str) -> bool {
         || (text.starts_with('(') && text.ends_with(')'))
 }
 
-fn run_asr(
+/// Applies AGC to every captured chunk as it arrives and reports the level for the meter.
+fn run_leveler(
     rx: Receiver<Vec<f32>>,
+    out: Sender<(Vec<f32>, Vec<f32>)>,
+    tx: &Sender<Event>,
+    repaint: &(impl Fn() + Send + Sync),
+    stop: &AtomicBool,
+) {
+    let mut agc = Agc::new();
+    let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
+    while !stop.load(Ordering::Relaxed) {
+        let raw = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(c) => c,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let mut leveled = raw.clone();
+        let rms = agc.process(&mut leveled);
+        let _ = tx.send(Event::Level { rms, gain_db: agc.gain_db() });
+        repaint();
+        chunks += 1;
+        peak = peak.max(rms);
+        if tick.elapsed() >= Duration::from_secs(2) {
+            debug_log(&format!("chunks={chunks} leveled_peak_rms={peak:.4} agc_gain={:.1}dB", agc.gain_db()));
+            (chunks, peak, tick) = (0, 0.0, std::time::Instant::now());
+        }
+        if out.send((raw, leveled)).is_err() {
+            break;
+        }
+    }
+}
+
+fn run_asr(
+    rx: Receiver<(Vec<f32>, Vec<f32>)>,
     model: &PathBuf,
     settings: SharedSettings,
     tx: &Sender<Event>,
@@ -247,29 +286,19 @@ fn run_asr(
 
     let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
     let mut seg = Segmenter::new();
-    let mut agc = Agc::new();
     let mut next_id = 0u64;
     let mut last_text = String::new();
-    let (mut chunks, mut peak, mut tick) = (0usize, 0f32, std::time::Instant::now());
+    let mut tick = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        let raw = match rx.recv_timeout(Duration::from_millis(200)) {
+        let (raw, leveled) = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut leveled = raw.clone();
-        let level = agc.process(&mut leveled);
-        let _ = tx.send(Event::Level { rms: level, gain_db: agc.gain_db() });
-        chunks += 1;
-        peak = peak.max(level);
         if tick.elapsed() >= Duration::from_secs(2) {
-            debug_log(&format!(
-                "chunks={chunks} leveled_peak_rms={peak:.4} agc_gain={:.1}dB {}",
-                agc.gain_db(),
-                seg.debug()
-            ));
-            (chunks, peak, tick) = (0, 0.0, std::time::Instant::now());
+            debug_log(&seg.debug());
+            tick = std::time::Instant::now();
         }
         for utterance in seg.push(&raw, &leveled) {
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });

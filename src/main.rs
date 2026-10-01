@@ -22,6 +22,7 @@ const SETTINGS_STORAGE_KEY: &str = "live-subtitle.settings.v1";
 const MAX_LINES: usize = 500;
 const METER_MIN_DB: f32 = -70.0;
 const METER_SILENCE_DB: f32 = -60.0;
+const METER_RELEASE_SECONDS: f32 = 0.12;
 const METER_LOUD_DB: f32 = -25.0;
 const METER_GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 89);
 const METER_YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 204, 0);
@@ -127,7 +128,8 @@ impl App {
         self.gain_db = 0.0;
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, dt: f32) {
+        let mut frame_peak = 0f32;
         while let Ok(ev) = self.rx.try_recv() {
             if !self.running() && !matches!(ev, Event::Translated { .. } | Event::TranslateFailed { .. }) {
                 continue;
@@ -136,7 +138,7 @@ impl App {
                 Event::Asr(s) => self.asr = s,
                 Event::Translator(s) => self.translator = s,
                 Event::Level { rms, gain_db } => {
-                    self.level = rms.max(self.level * 0.95);
+                    frame_peak = frame_peak.max(rms);
                     self.gain_db = gain_db;
                 }
                 Event::Heard { id, lang, text } => {
@@ -159,6 +161,8 @@ impl App {
                 }
             }
         }
+        // Rises instantly with the loudest chunk of this frame, falls with a short time constant.
+        self.level = frame_peak.max(self.level * (-dt / METER_RELEASE_SECONDS).exp());
     }
 
     fn set_japanese(&mut self, id: u64, value: Japanese) {
@@ -215,7 +219,7 @@ impl App {
             }
             ui.label(self.status_text());
         });
-        if self.running() && self.asr == Stage::Ready {
+        if self.running() {
             ui.horizontal(|ui| {
                 let db = 20.0 * self.level.max(1e-7).log10();
                 let silent = db < METER_SILENCE_DB;
@@ -359,7 +363,7 @@ fn level_command(on_top: bool) -> egui::ViewportCommand {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        self.drain_events(ui.input(|i| i.unstable_dt).min(0.1));
         egui::Panel::top("controls").show_inside(ui, |ui| self.controls(ui));
         egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
     }
