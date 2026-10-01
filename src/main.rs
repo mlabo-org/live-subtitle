@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod app_shell_foundation;
 mod agc;
+mod band;
 mod capture;
 mod pipeline;
 mod translate;
@@ -15,11 +16,17 @@ use pipeline::{Event, Pipeline, Stage};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use translate::{Engine, TranslateSettings};
 
 const APP_SHELL_STORAGE_KEY: &str = "live-subtitle.app-shell-preferences.v1";
 const SETTINGS_STORAGE_KEY: &str = "live-subtitle.settings.v1";
+/// eframe's own storage key for the window position and size.
+const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const MAX_LINES: usize = 500;
+const BAND_VISIBLE_SECONDS: f64 = 10.0;
+const NORMAL_MIN_SIZE: [f32; 2] = [380.0, 260.0];
+const BAND_MIN_SIZE: [f32; 2] = [240.0, 70.0];
 const METER_MIN_DB: f32 = -70.0;
 const METER_SILENCE_DB: f32 = -60.0;
 const METER_RELEASE_SECONDS: f32 = 0.12;
@@ -32,11 +39,14 @@ struct Persisted {
     translate: TranslateSettings,
     always_on_top: bool,
     show_original: bool,
+    /// Last position and size of the band (x, y, width, height), restored the next time it opens.
+    #[serde(default)]
+    band_rect: Option<[f32; 4]>,
 }
 
 impl Default for Persisted {
     fn default() -> Self {
-        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true }
+        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_rect: None }
     }
 }
 
@@ -55,6 +65,13 @@ struct Line {
     japanese: Japanese,
 }
 
+/// Window state remembered while the band is shown, so ESC can restore the ordinary window.
+struct BandState {
+    restore_pos: egui::Pos2,
+    restore_size: egui::Vec2,
+    passthrough: bool,
+}
+
 struct App {
     preferences: AppShellPreferences,
     persisted: Persisted,
@@ -69,6 +86,10 @@ struct App {
     gain_db: f32,
     error: Option<String>,
     ollama_models: Vec<String>,
+    band: Option<BandState>,
+    band_configured: bool,
+    last_line_at: Option<Instant>,
+    auto_band: bool,
 }
 
 impl App {
@@ -97,6 +118,10 @@ impl App {
             gain_db: 0.0,
             error: None,
             ollama_models: translate::ollama_models(),
+            band: None,
+            band_configured: false,
+            last_line_at: None,
+            auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
         if autostart {
             app.start(&cc.egui_ctx);
@@ -149,11 +174,15 @@ impl App {
                         Japanese::Pending
                     };
                     self.lines.push(Line { id, lang, original: text, japanese });
+                    self.last_line_at = Some(Instant::now());
                     if self.lines.len() > MAX_LINES {
                         self.lines.remove(0);
                     }
                 }
-                Event::Translated { id, text } => self.set_japanese(id, Japanese::Done(text)),
+                Event::Translated { id, text } => {
+                    self.set_japanese(id, Japanese::Done(text));
+                    self.last_line_at = Some(Instant::now());
+                }
                 Event::TranslateFailed { id, error } => self.set_japanese(id, Japanese::Failed(error)),
                 Event::Fatal(e) => {
                     self.error = Some(e);
@@ -304,6 +333,13 @@ impl App {
                 ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
             }
             ui.checkbox(&mut self.persisted.show_original, "原文も表示");
+            if ui
+                .button("帯にする")
+                .on_hover_text("字幕だけの軽量表示にする。ドラッグで移動、端でサイズ変更。ESC で元に戻る")
+                .clicked()
+            {
+                let _ = self.enter_band(ui.ctx());
+            }
             if ui.button("クリア").clicked() {
                 self.lines.clear();
             }
@@ -317,6 +353,125 @@ impl App {
                 apply_app_shell_preferences(ui.ctx(), self.preferences);
             }
         });
+    }
+
+    /// Switches to the compact subtitle view. Returns false when the window geometry is not known yet
+    /// (the first frames after launch).
+    fn enter_band(&mut self, ctx: &egui::Context) -> bool {
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let (Some(outer), Some(inner)) = (outer, inner) else {
+            return false;
+        };
+        let (pos, size) = match self.persisted.band_rect {
+            Some([x, y, w, h]) => (egui::pos2(x, y), egui::vec2(w, h)),
+            None => {
+                // The display is measured in macOS points; egui's window coordinates are those divided by the UI zoom.
+                let zoom = ctx.zoom_factor();
+                let display = band::display_rect_containing(outer.center() * zoom);
+                let display = egui::Rect::from_min_max(display.min / zoom, display.max / zoom);
+                band::default_band(display, band::band_height(f32::from(self.preferences.font_size_points)))
+            }
+        };
+        self.band = Some(BandState { restore_pos: outer.min, restore_size: inner.size(), passthrough: false });
+        use egui::ViewportCommand as Cmd;
+        for cmd in [
+            Cmd::Decorations(false),
+            Cmd::Resizable(true),
+            Cmd::MinInnerSize(egui::vec2(BAND_MIN_SIZE[0], BAND_MIN_SIZE[1])),
+            Cmd::InnerSize(size),
+            Cmd::OuterPosition(pos),
+            level_command(true),
+            Cmd::Focus,
+        ] {
+            ctx.send_viewport_cmd(cmd);
+        }
+        true
+    }
+
+    fn exit_band(&mut self, ctx: &egui::Context) {
+        let Some(band) = self.band.take() else {
+            return;
+        };
+        if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            self.persisted.band_rect = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
+        }
+        use egui::ViewportCommand as Cmd;
+        for cmd in [
+            Cmd::MousePassthrough(false),
+            Cmd::Decorations(true),
+            Cmd::Resizable(true),
+            Cmd::MinInnerSize(egui::vec2(NORMAL_MIN_SIZE[0], NORMAL_MIN_SIZE[1])),
+            Cmd::InnerSize(band.restore_size),
+            Cmd::OuterPosition(band.restore_pos),
+            level_command(self.persisted.always_on_top),
+            Cmd::Focus,
+        ] {
+            ctx.send_viewport_cmd(cmd);
+        }
+    }
+
+    /// The telop: the newest subtitle on a translucent strip that fades out when nothing is being said.
+    fn band_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let latest = self.lines.last();
+        let pending = matches!(latest.map(|l| &l.japanese), Some(Japanese::Pending));
+        let fresh = self.last_line_at.is_some_and(|t| t.elapsed().as_secs_f64() < BAND_VISIBLE_SECONDS);
+        let visible = latest.is_some() && (pending || fresh);
+        if latest.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        let alpha = ctx.animate_bool_with_time(egui::Id::new("band-visible"), visible, 0.25);
+        // While nothing is shown the strip lets mouse clicks through to the video underneath.
+        if let Some(band) = &mut self.band {
+            if band.passthrough == visible {
+                band.passthrough = !visible;
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!visible));
+            }
+        }
+        let size = band::unit_for_height(ctx.content_rect().height());
+        let content = latest.map(|l| {
+            let (main, color) = match &l.japanese {
+                Japanese::Done(ja) => (ja.clone(), egui::Color32::WHITE),
+                Japanese::Pending => ("…".to_string(), APP_SHELL_WEAK_TEXT),
+                Japanese::NotNeeded | Japanese::Failed(_) => (l.original.clone(), egui::Color32::WHITE),
+            };
+            let original = (self.persisted.show_original
+                && matches!(l.japanese, Japanese::Done(_) | Japanese::Pending))
+            .then(|| format!("[{}] {}", l.lang, l.original));
+            (main, color, original)
+        });
+        let mut exit = false;
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 14.0, egui::Color32::from_black_alpha((190.0 * alpha) as u8));
+            let drag = ui.interact(rect, egui::Id::new("band-drag"), egui::Sense::click_and_drag());
+            if drag.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if let Some((main, color, original)) = content {
+                let width = rect.width() - 48.0;
+                ui.add_space(14.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(egui::Label::new(band_job(&main, size * 1.9, color.gamma_multiply(alpha), 2, width)).selectable(false));
+                    if let Some(original) = original {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(band_job(&original, size, APP_SHELL_WEAK_TEXT.gamma_multiply(alpha), 1, width))
+                                .selectable(false),
+                        );
+                    }
+                });
+            }
+            if alpha > 0.05 && ui.rect_contains_pointer(rect) {
+                let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 6.0), egui::vec2(144.0, 24.0));
+                if ui.put(button, egui::Button::new("元に戻す（ESC）").small()).clicked() {
+                    exit = true;
+                }
+            }
+        });
+        if exit {
+            self.exit_band(&ctx);
+        }
     }
 
     fn subtitles(&self, ui: &mut egui::Ui) {
@@ -353,6 +508,21 @@ impl App {
     }
 }
 
+fn band_job(text: &str, size: f32, color: egui::Color32, rows: usize, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat { font_id: egui::FontId::proportional(size), color, ..Default::default() },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: width,
+        max_rows: rows,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    job.halign = egui::Align::Center;
+    job
+}
+
 fn level_command(on_top: bool) -> egui::ViewportCommand {
     egui::ViewportCommand::WindowLevel(if on_top {
         egui::WindowLevel::AlwaysOnTop
@@ -362,23 +532,53 @@ fn level_command(on_top: bool) -> egui::ViewportCommand {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.drain_events(ui.input(|i| i.unstable_dt).min(0.1));
-        egui::Panel::top("controls").show_inside(ui, |ui| self.controls(ui));
-        egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
+        if self.band.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.exit_band(ui.ctx());
+        }
+        // Wait a few frames so the window has settled on its real position before it is remembered.
+        if self.auto_band && ui.ctx().cumulative_frame_nr() > 30 && self.enter_band(ui.ctx()) {
+            self.auto_band = false;
+        }
+        let band_active = self.band.is_some();
+        if band_active || self.band_configured {
+            band::configure_window(frame, band_active);
+            self.band_configured = band_active;
+        }
+        if band_active {
+            self.band_ui(ui);
+        } else {
+            egui::Panel::top("controls").show_inside(ui, |ui| self.controls(ui));
+            egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
+        }
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.band.is_some() {
+            [0.0; 4]
+        } else {
+            egui::Rgba::from(visuals.panel_fill).to_array()
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         save_app_shell_preferences(storage, APP_SHELL_STORAGE_KEY, &self.preferences);
         eframe::set_value(storage, SETTINGS_STORAGE_KEY, &self.persisted);
+        // eframe restores the stored window geometry on every launch; blank it so the band's geometry
+        // (or one saved by an earlier build) never becomes the normal window.
+        storage.set_string(EFRAME_WINDOW_STORAGE_KEY, String::new());
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
+        // The band changes the window geometry; do not let that become the next launch's normal window.
+        persist_window: false,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([680.0, 480.0])
-            .with_min_inner_size([380.0, 260.0]),
+            .with_min_inner_size(NORMAL_MIN_SIZE)
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native("Live Subtitle", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

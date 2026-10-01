@@ -11,6 +11,10 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
+core-graphics = "0.23"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSColor"] }
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 3
