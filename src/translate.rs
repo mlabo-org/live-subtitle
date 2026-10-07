@@ -1,5 +1,6 @@
 //! Translation backends: a local Ollama server, long-lived Claude CLI sessions, or a Codex App Server.
 
+use crate::app_shell_foundation::AppShellLanguage;
 use serde::{Deserialize, Serialize};
 use std::process::ChildStdout;
 use std::sync::mpsc::Receiver;
@@ -7,13 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-/// Claude models offered in the window: an explicit version, a short label. Aliases such as "haiku" are
-/// avoided because the version they point at changes with the CLI.
-pub const CLAUDE_MODELS: [(&str, &str); 4] = [
-    ("claude-haiku-4-5-20251001", "Haiku 4.5（最速・約0.7秒）"),
-    ("claude-sonnet-5-5", "Sonnet 5.5（自然・約1.7秒）"),
-    ("claude-opus-5-5", "Opus 5.5（自然・約2秒）"),
-    ("claude-fable-5-1", "Fable 5.1（高品質・約0.8秒）"),
+/// Claude models offered in the window: an explicit version, a short label in Japanese and in English. Aliases
+/// such as "haiku" are avoided because the version they point at changes with the CLI.
+pub const CLAUDE_MODELS: [(&str, &str, &str); 4] = [
+    ("claude-haiku-4-5-20251001", "Haiku 4.5（最速・約0.7秒）", "Haiku 4.5 (fastest, ~0.7 s)"),
+    ("claude-sonnet-5-5", "Sonnet 5.5（自然・約1.7秒）", "Sonnet 5.5 (natural, ~1.7 s)"),
+    ("claude-opus-5-5", "Opus 5.5（自然・約2秒）", "Opus 5.5 (natural, ~2 s)"),
+    ("claude-fable-5-1", "Fable 5.1（高品質・約0.8秒）", "Fable 5.1 (high quality, ~0.8 s)"),
 ];
 
 /// Settings saved by earlier builds stored an alias; this returns the explicit model it stood for.
@@ -36,11 +37,16 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, language: AppShellLanguage) -> &'static str {
+        let english = language == AppShellLanguage::English;
         match self {
+            Engine::Ollama if english => "Ollama (local, fast)",
             Engine::Ollama => "Ollama（ローカル・速い）",
+            Engine::Claude if english => "Claude (high quality)",
             Engine::Claude => "Claude（高品質）",
+            Engine::Codex if english => "Codex (ChatGPT account)",
             Engine::Codex => "Codex（ChatGPT アカウント）",
+            Engine::Off if english => "Off (original only)",
             Engine::Off => "翻訳しない（原文のみ）",
         }
     }

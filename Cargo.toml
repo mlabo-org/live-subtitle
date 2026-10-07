@@ -16,6 +16,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 core-graphics = "0.23"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSColor"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSLocale", "NSString"] }
 raw-window-handle = "0.6"
 rfd = "0.17"
 signal-hook = "0.3"

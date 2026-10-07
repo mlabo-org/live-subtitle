@@ -11,9 +11,9 @@ mod sentences;
 mod translate;
 
 use app_shell_foundation::{
-    apply_app_shell_preferences, install_macos_system_fonts, load_app_shell_preferences,
+    app_shell_control_metrics, apply_app_shell_preferences, install_macos_system_fonts, load_app_shell_preferences,
     save_app_shell_preferences, show_app_shell_preferences, AppShellLanguage, AppShellPreferences,
-    APP_SHELL_WEAK_TEXT,
+    APP_SHELL_DARK_SELECTION, APP_SHELL_LIGHT_SELECTION, APP_SHELL_WEAK_TEXT,
 };
 use eframe::egui;
 use pipeline::{Event, Pipeline, Stage};
@@ -39,6 +39,7 @@ const METER_RELEASE_SECONDS: f32 = 0.12;
 const METER_LOUD_DB: f32 = -25.0;
 const METER_GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 89);
 const METER_YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 204, 0);
+const ERROR_RED: egui::Color32 = egui::Color32::from_rgb(220, 60, 60);
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Persisted {
@@ -71,6 +72,24 @@ enum Auth {
     Failed(String),
 }
 
+/// Why Ollama's memory is being freed; it prefixes the result shown in the window.
+#[derive(Clone, Copy, PartialEq)]
+enum Release {
+    Startup,
+    Manual,
+    ModelSwitch,
+}
+
+impl Release {
+    fn label(self, lang: AppShellLanguage) -> &'static str {
+        match self {
+            Release::Startup => tr(lang, "起動時", "At launch"),
+            Release::Manual => tr(lang, "手動", "Manual"),
+            Release::ModelSwitch => tr(lang, "モデル切り替え", "Model switch"),
+        }
+    }
+}
+
 enum Japanese {
     Pending,
     Done(String),
@@ -98,6 +117,12 @@ struct BandState {
 
 struct App {
     preferences: AppShellPreferences,
+    /// The macOS language, used when the language preference is "System".
+    system_language: AppShellLanguage,
+    /// The language the window is shown in, resolved from the preference every frame.
+    lang: AppShellLanguage,
+    /// Whether the settings replace the subtitles in the window.
+    settings_open: bool,
     persisted: Persisted,
     shared: pipeline::SharedSettings,
     pipeline: Option<Pipeline>,
@@ -147,8 +172,12 @@ impl App {
         let (auth_tx, auth_rx) = mpsc::channel();
         let (notice_tx, notice_rx) = mpsc::channel();
         let autostart = std::env::var_os("LIVE_SUBTITLE_AUTOSTART").is_some();
+        let system_language = system_language();
         let mut app = Self {
             preferences,
+            system_language,
+            lang: preferences.language.resolve(system_language),
+            settings_open: false,
             shared: Arc::new(Mutex::new(persisted.translate.clone())),
             persisted,
             pipeline: None,
@@ -181,7 +210,7 @@ impl App {
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
         // A crash or a force-quit can leave models in memory; start from a clean slate.
-        app.release_ollama(&cc.egui_ctx, "起動時", false);
+        app.release_ollama(&cc.egui_ctx, Release::Startup, false);
         app.fetch_ollama_models(&cc.egui_ctx);
         if autostart {
             app.start(&cc.egui_ctx);
@@ -207,23 +236,31 @@ impl App {
         self.notice = Some(match history::save(&history::history_dir(self.persisted.history_dir.as_deref()), &records) {
             Ok(path) => {
                 let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
-                format!("{} 件を保存しました: {}", records.len(), path.display())
+                match self.lang {
+                    AppShellLanguage::Japanese => format!("{} 件を保存しました: {}", records.len(), path.display()),
+                    AppShellLanguage::English => format!("Saved {} lines: {}", records.len(), path.display()),
+                }
             }
-            Err(e) => format!("保存できなかった: {e}"),
+            Err(e) => format!("{}: {e}", tr(self.lang, "保存できなかった", "Could not save")),
         });
     }
 
-    /// Frees every model Ollama holds in memory, in the background. `reason` prefixes the result shown in the
-    /// window; with `warm_up_after` the translation model is loaded again once the memory is free.
-    fn release_ollama(&mut self, ctx: &egui::Context, reason: &'static str, warm_up_after: bool) {
-        let (notice, ctx) = (self.notice_tx.clone(), ctx.clone());
+    /// Frees every model Ollama holds in memory, in the background, and shows the result in the window; with
+    /// `warm_up_after` the translation model is loaded again once the memory is free.
+    fn release_ollama(&mut self, ctx: &egui::Context, reason: Release, warm_up_after: bool) {
+        let (notice, ctx, lang) = (self.notice_tx.clone(), ctx.clone(), self.lang);
         let warm = warm_up_after.then(|| (self.shared.clone(), self.tx.clone()));
         std::thread::spawn(move || {
-            let message = match translate::ollama_unload_all() {
-                Ok(0) if reason == "手動" => "読み込み中の Ollama モデルはありません".to_string(),
-                Ok(0) => String::new(),
-                Ok(n) => format!("{reason}: Ollama のモデルを {n} 個、メモリから解放した"),
-                Err(e) => format!("{reason}: Ollama のモデルを解放できなかった: {e}"),
+            let label = reason.label(lang);
+            let message = match (translate::ollama_unload_all(), lang) {
+                (Ok(0), _) if reason == Release::Manual => {
+                    tr(lang, "読み込み中の Ollama モデルはありません", "No Ollama model is loaded").to_string()
+                }
+                (Ok(0), _) => String::new(),
+                (Ok(n), AppShellLanguage::Japanese) => format!("{label}: Ollama のモデルを {n} 個、メモリから解放した"),
+                (Ok(n), AppShellLanguage::English) => format!("{label}: freed {n} Ollama model(s) from memory"),
+                (Err(e), AppShellLanguage::Japanese) => format!("{label}: Ollama のモデルを解放できなかった: {e}"),
+                (Err(e), AppShellLanguage::English) => format!("{label}: could not free Ollama's models: {e}"),
             };
             let _ = notice.send(message);
             if let Some((settings, tx)) = warm {
@@ -301,31 +338,39 @@ impl App {
             Engine::Ollama | Engine::Off => return,
         };
         let who = if engine == Engine::Claude { "Claude" } else { "ChatGPT" };
-        let red = egui::Color32::from_rgb(220, 60, 60);
+        let lang = self.lang;
+        let say = |ja: &str, en: &str| match lang {
+            AppShellLanguage::Japanese => format!("{who} {ja}"),
+            AppShellLanguage::English => format!("{en} {who}"),
+        };
         ui.horizontal_wrapped(|ui| match state {
             Auth::Unknown | Auth::Checking => {
                 ui.spinner();
-                ui.label(format!("{who} のサインインを確認中…"));
+                ui.label(say("のサインインを確認中…", "Checking the sign-in to"));
             }
             Auth::SignedIn => {
-                ui.colored_label(METER_GREEN, format!("{who} にサインイン済み"));
+                ui.colored_label(METER_GREEN, say("にサインイン済み", "Signed in to"));
             }
             Auth::SignedOut => {
-                ui.colored_label(red, format!("{who} にサインインしていません"));
-                if ui.button(format!("{who} にサインイン")).on_hover_text("ブラウザで公式のサインイン画面を開く").clicked() {
+                ui.colored_label(ERROR_RED, say("にサインインしていません", "Not signed in to"));
+                if ui
+                    .button(say("にサインイン", "Sign in to"))
+                    .on_hover_text(tr(lang, "ブラウザで公式のサインイン画面を開く", "Opens the official sign-in page in the browser"))
+                    .clicked()
+                {
                     self.sign_in(engine, ui.ctx());
                 }
             }
             Auth::SigningIn => {
                 ui.spinner();
-                ui.label("ブラウザでサインインを完了してください…");
+                ui.label(tr(lang, "ブラウザでサインインを完了してください…", "Finish signing in in the browser…"));
             }
             Auth::Failed(e) => {
-                ui.colored_label(red, e);
-                if ui.small_button("再確認").clicked() {
+                ui.colored_label(ERROR_RED, e);
+                if ui.small_button(tr(lang, "再確認", "Check again")).clicked() {
                     self.check_auth(engine, ui.ctx());
                 }
-                if ui.small_button(format!("{who} にサインイン")).clicked() {
+                if ui.small_button(say("にサインイン", "Sign in to")).clicked() {
                     self.sign_in(engine, ui.ctx());
                 }
             }
@@ -382,7 +427,9 @@ impl App {
             self.codex_models_rx = None;
             match result {
                 Ok(models) => self.codex_models = models,
-                Err(e) => self.error = Some(format!("Codex のモデル一覧を取れない: {e}")),
+                Err(e) => {
+                    self.error = Some(format!("{}: {e}", tr(self.lang, "Codex のモデル一覧を取れない", "Could not list Codex's models")))
+                }
             }
         }
     }
@@ -465,18 +512,19 @@ impl App {
     }
 
     fn status_text(&self) -> String {
+        let lang = self.lang;
         if !self.running() {
-            return "停止中".into();
+            return tr(lang, "停止中", "Stopped").into();
         }
         let mut parts = Vec::new();
         if self.asr == Stage::Loading {
-            parts.push("音声認識モデル読み込み中…");
+            parts.push(tr(lang, "音声認識モデル読み込み中…", "Loading the speech model…"));
         }
         if self.translator == Stage::Loading {
-            parts.push("翻訳モデル読み込み中…");
+            parts.push(tr(lang, "翻訳モデル読み込み中…", "Loading the translation model…"));
         }
         if parts.is_empty() {
-            "聞き取り中".into()
+            tr(lang, "聞き取り中", "Listening").into()
         } else {
             parts.join(" / ")
         }
@@ -497,11 +545,40 @@ impl App {
             .join("\n\n")
     }
 
+    /// The top of the window, always shown: start/stop and what the app is doing, the band and settings buttons,
+    /// the level while running, the translation engine and model, and anything that needs the user (sign-in,
+    /// errors, the result of the last action).
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            let label = if self.running() { "■ 停止" } else { "● 開始" };
-            if ui.button(label).clicked() {
-                if self.running() {
+        let lang = self.lang;
+        self.poll_codex_models();
+        self.poll_ollama_models();
+        self.poll_auth();
+        self.poll_notices();
+        let engine = self.persisted.translate.engine;
+        if engine == Engine::Codex && !self.codex_models_tried {
+            self.fetch_codex_models(ui.ctx());
+        }
+        if matches!(engine, Engine::Claude if self.claude_auth == Auth::Unknown)
+            || matches!(engine, Engine::Codex if self.codex_auth == Auth::Unknown)
+        {
+            self.check_auth(engine, ui.ctx());
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let running = self.running();
+            let (label, fill) = if running {
+                (tr(lang, "■ 停止", "■ Stop"), ERROR_RED)
+            } else if ui.visuals().dark_mode {
+                (tr(lang, "● 開始", "● Start"), APP_SHELL_DARK_SELECTION)
+            } else {
+                (tr(lang, "● 開始", "● Start"), APP_SHELL_LIGHT_SELECTION)
+            };
+            let height = app_shell_control_metrics(ui.ctx()).row_height * 1.2;
+            let button = egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE))
+                .fill(fill)
+                .min_size(egui::vec2(height * 2.8, height));
+            if ui.add(button).clicked() {
+                if running {
                     self.stop();
                 } else {
                     self.start(ui.ctx());
@@ -510,232 +587,323 @@ impl App {
             if self.loading() {
                 ui.spinner();
             }
-            ui.label(self.status_text());
+            if running {
+                ui.label(self.status_text());
+                if !self.loading() && self.level_db() < METER_SILENCE_DB {
+                    ui.colored_label(APP_SHELL_WEAK_TEXT, tr(lang, "無音", "Silent"));
+                }
+            } else {
+                ui.colored_label(APP_SHELL_WEAK_TEXT, self.status_text());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(tr(lang, "設定", "Settings")).selected(self.settings_open))
+                    .on_hover_text(tr(
+                        lang,
+                        "翻訳・ウィンドウ・保存先・表示の設定を開く／閉じる",
+                        "Open or close the translation, window, folder and appearance settings",
+                    ))
+                    .clicked()
+                {
+                    self.settings_open = !self.settings_open;
+                }
+                if ui
+                    .button(tr(lang, "帯にする", "Caption bar"))
+                    .on_hover_text(tr(
+                        lang,
+                        "字幕だけの軽量表示にする。ドラッグで移動、端でサイズ変更。ESC で元に戻る",
+                        "Show only the subtitles on a slim bar. Drag to move, drag the edges to resize, Esc to return",
+                    ))
+                    .clicked()
+                {
+                    let _ = self.enter_band(ui.ctx());
+                }
+            });
         });
         if self.running() {
-            ui.horizontal(|ui| {
-                let db = 20.0 * self.level.max(1e-7).log10();
-                let silent = db < METER_SILENCE_DB;
-                ui.label("入力音声");
-                let mut bar = egui::ProgressBar::new(((db - METER_MIN_DB) / -METER_MIN_DB).clamp(0.0, 1.0))
-                    .desired_width(160.0)
-                    .fill(if silent {
-                        APP_SHELL_WEAK_TEXT
-                    } else if db > METER_LOUD_DB {
-                        METER_YELLOW
-                    } else {
-                        METER_GREEN
-                    });
-                if silent {
-                    bar = bar.text("無音");
-                }
-                ui.add(bar).on_hover_text(format!("自動音量補正（AGC）: +{:.0} dB", self.gain_db));
-            });
-        }
-        if let Some(e) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
+            self.level_bar(ui);
         }
         ui.horizontal_wrapped(|ui| {
-            let dir = history::history_dir(self.persisted.history_dir.as_deref());
-            ui.colored_label(APP_SHELL_WEAK_TEXT, format!("履歴の保存先: {}", history::display_dir(&dir)));
-            if self.persisted.history_dir.is_some() && ui.small_button("デスクトップに戻す").clicked() {
-                self.persisted.history_dir = None;
-            }
+            center_on_buttons(ui);
+            ui.colored_label(APP_SHELL_WEAK_TEXT, tr(lang, "翻訳", "Translate"));
+            self.translation_pickers(ui);
         });
+        let signed_in = match engine {
+            Engine::Claude => self.claude_auth == Auth::SignedIn,
+            Engine::Codex => self.codex_auth == Auth::SignedIn,
+            Engine::Ollama | Engine::Off => true,
+        };
+        // Open settings show the sign-in state in their translation section instead.
+        if !signed_in && !self.settings_open {
+            self.auth_row(ui, engine);
+        }
+        if let Some(e) = &self.error {
+            ui.colored_label(ERROR_RED, e);
+        }
         if let Some(notice) = &self.notice {
             ui.colored_label(APP_SHELL_WEAK_TEXT, notice);
         }
-        ui.horizontal_wrapped(|ui| {
-            let mut changed = false;
-            let before_engine = self.persisted.translate.engine;
-            let before_model = self.persisted.translate.ollama_model.clone();
-            let before_claude = self.persisted.translate.claude_model.clone();
-            let before_codex = (self.persisted.translate.codex_model.clone(), self.persisted.translate.codex_effort.clone());
-            self.poll_codex_models();
-            self.poll_ollama_models();
-            if self.persisted.translate.engine == Engine::Codex && !self.codex_models_tried {
-                self.fetch_codex_models(ui.ctx());
+        ui.add_space(2.0);
+    }
+
+    fn level_db(&self) -> f32 {
+        20.0 * self.level.max(1e-7).log10()
+    }
+
+    /// A thin bar across the window showing how loud the captured sound is.
+    fn level_bar(&self, ui: &mut egui::Ui) {
+        let db = self.level_db();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 5.0), egui::Sense::hover());
+        let fraction = ((db - METER_MIN_DB) / -METER_MIN_DB).clamp(0.0, 1.0);
+        let color = if db < METER_SILENCE_DB {
+            APP_SHELL_WEAK_TEXT
+        } else if db > METER_LOUD_DB {
+            METER_YELLOW
+        } else {
+            METER_GREEN
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.5, ui.visuals().extreme_bg_color);
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * fraction, rect.height())), 2.5, color);
+        response.on_hover_text(match self.lang {
+            AppShellLanguage::Japanese => format!("入力音声の大きさ（自動音量補正 +{:.0} dB）", self.gain_db),
+            AppShellLanguage::English => format!("Level of the captured sound (automatic gain +{:.0} dB)", self.gain_db),
+        });
+    }
+
+    /// The translation engine and its model (and Codex's effort). A change is handed to the pipeline by
+    /// `apply_translate_change` at the end of the frame.
+    fn translation_pickers(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let t = &mut self.persisted.translate;
+        egui::ComboBox::from_id_salt("engine").selected_text(t.engine.label(lang)).show_ui(ui, |ui| {
+            for e in [Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
+                ui.selectable_value(&mut t.engine, e, e.label(lang));
             }
-            ui.label("翻訳先");
-            egui::ComboBox::from_id_salt("engine")
-                .selected_text(self.persisted.translate.engine.label())
-                .show_ui(ui, |ui| {
-                    for e in [Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
-                        changed |= ui
-                            .selectable_value(&mut self.persisted.translate.engine, e, e.label())
-                            .changed();
+        });
+        match t.engine {
+            Engine::Ollama => {
+                egui::ComboBox::from_id_salt("ollama-model").selected_text(t.ollama_model.clone()).show_ui(ui, |ui| {
+                    let mut names = self.ollama_models.clone();
+                    if !names.contains(&t.ollama_model) {
+                        names.insert(0, t.ollama_model.clone());
+                    }
+                    for n in names {
+                        ui.selectable_value(&mut t.ollama_model, n.clone(), n);
                     }
                 });
-            match self.persisted.translate.engine {
+            }
+            Engine::Claude => {
+                let label = translate::CLAUDE_MODELS
+                    .iter()
+                    .find(|(id, _, _)| *id == t.claude_model)
+                    .map_or(t.claude_model.as_str(), |(_, ja, en)| tr(lang, ja, en));
+                egui::ComboBox::from_id_salt("claude-model").selected_text(label).show_ui(ui, |ui| {
+                    for (id, ja, en) in translate::CLAUDE_MODELS {
+                        if ui.selectable_value(&mut t.claude_model, id.to_string(), tr(lang, ja, en)).changed() {
+                            self.claude_model_edit = t.claude_model.clone();
+                        }
+                    }
+                });
+            }
+            Engine::Codex => {
+                let name = self
+                    .codex_models
+                    .iter()
+                    .find(|m| m.id == t.codex_model)
+                    .map_or(t.codex_model.as_str(), |m| m.name.as_str());
+                egui::ComboBox::from_id_salt("codex-model").selected_text(name).show_ui(ui, |ui| {
+                    for m in &self.codex_models {
+                        if ui.selectable_value(&mut t.codex_model, m.id.clone(), &m.name).changed()
+                            && !t.codex_effort.is_empty()
+                            && !m.efforts.contains(&t.codex_effort)
+                        {
+                            t.codex_effort.clear();
+                        }
+                    }
+                });
+                let efforts = self
+                    .codex_models
+                    .iter()
+                    .find(|m| m.id == t.codex_model)
+                    .map(|m| m.efforts.clone())
+                    .unwrap_or_default();
+                let default = tr(lang, "既定", "default");
+                let shown = if t.codex_effort.is_empty() { default } else { t.codex_effort.as_str() };
+                let effort_label = format!("{}: {shown}", tr(lang, "考える強さ", "Effort"));
+                egui::ComboBox::from_id_salt("codex-effort").selected_text(effort_label).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut t.codex_effort, String::new(), default);
+                    for e in efforts {
+                        ui.selectable_value(&mut t.codex_effort, e.clone(), e);
+                    }
+                });
+            }
+            Engine::Off => {}
+        }
+    }
+
+    /// Hands a translation setting changed this frame to the pipeline, and while running loads the newly chosen
+    /// model.
+    fn apply_translate_change(&mut self, ctx: &egui::Context, before: &TranslateSettings) {
+        let t = &self.persisted.translate;
+        let changed = t.engine != before.engine
+            || t.ollama_model != before.ollama_model
+            || t.claude_model != before.claude_model
+            || t.codex_model != before.codex_model
+            || t.codex_effort != before.codex_effort;
+        if !changed {
+            return;
+        }
+        if let Ok(mut s) = self.shared.lock() {
+            *s = t.clone();
+        }
+        let reload = match t.engine {
+            Engine::Ollama => before.engine != Engine::Ollama || before.ollama_model != t.ollama_model,
+            Engine::Claude => before.engine != Engine::Claude || before.claude_model != t.claude_model,
+            Engine::Codex => {
+                before.engine != Engine::Codex || (&before.codex_model, &before.codex_effort) != (&t.codex_model, &t.codex_effort)
+            }
+            Engine::Off => false,
+        };
+        // Leaving an Ollama model (another model, or another engine) frees its memory first, so two large
+        // models are never resident together; the new model is loaded once the memory is free.
+        let left_ollama_model =
+            before.engine == Engine::Ollama && (t.engine != Engine::Ollama || t.ollama_model != before.ollama_model);
+        let warm_up_now = self.running() && reload;
+        if left_ollama_model {
+            self.release_ollama(ctx, Release::ModelSwitch, warm_up_now);
+        } else if warm_up_now {
+            let ctx = ctx.clone();
+            pipeline::warm_up(self.shared.clone(), self.tx.clone(), move || ctx.request_repaint());
+        }
+    }
+
+    /// What is changed rarely, in place of the subtitles while open.
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            settings_section(ui, tr(lang, "翻訳", "Translation"), |ui| match self.persisted.translate.engine {
                 Engine::Ollama => {
-                    let t = &mut self.persisted.translate;
-                    egui::ComboBox::from_id_salt("ollama-model")
-                        .selected_text(t.ollama_model.clone())
-                        .show_ui(ui, |ui| {
-                            let mut names = self.ollama_models.clone();
-                            if !names.contains(&t.ollama_model) {
-                                names.insert(0, t.ollama_model.clone());
-                            }
-                            for n in names {
-                                changed |= ui.selectable_value(&mut t.ollama_model, n.clone(), n).changed();
-                            }
-                        });
-                    if ui.small_button("更新").on_hover_text("Ollama のモデル一覧を取り直す").clicked() {
-                        self.fetch_ollama_models(ui.ctx());
-                    }
-                    if ui
-                        .button("メモリ解放")
-                        .on_hover_text("Ollama がメモリに載せている全モデルを解放する（他のアプリが使っているモデルも対象。次に使うとき再読み込みされる）")
-                        .clicked()
-                    {
-                        self.release_ollama(ui.ctx(), "手動", false);
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(tr(lang, "モデル一覧を更新", "Refresh models")).clicked() {
+                            self.fetch_ollama_models(ui.ctx());
+                        }
+                        if ui.button(tr(lang, "メモリ解放", "Free memory")).clicked() {
+                            self.release_ollama(ui.ctx(), Release::Manual, false);
+                        }
+                    });
+                    ui.colored_label(
+                        APP_SHELL_WEAK_TEXT,
+                        tr(
+                            lang,
+                            "メモリ解放: Ollama がメモリに載せている全モデルを解放する（他のアプリが使っているモデルも対象。次に使うとき再読み込みされる）",
+                            "Free memory: unloads every model Ollama holds in memory (also those other apps use; they load again when next used)",
+                        ),
+                    );
                 }
                 Engine::Claude => {
-                    let t = &mut self.persisted.translate;
-                    let label = translate::CLAUDE_MODELS
-                        .iter()
-                        .find(|(id, _)| *id == t.claude_model)
-                        .map_or(t.claude_model.as_str(), |(_, label)| *label);
-                    egui::ComboBox::from_id_salt("claude-model").selected_text(label).show_ui(ui, |ui| {
-                        for (id, label) in translate::CLAUDE_MODELS {
-                            if ui.selectable_value(&mut t.claude_model, id.to_string(), label).changed() {
-                                changed = true;
-                                self.claude_model_edit = t.claude_model.clone();
+                    self.auth_row(ui, Engine::Claude);
+                    if self.claude_model_edit.is_empty() {
+                        self.claude_model_edit = self.persisted.translate.claude_model.clone();
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(tr(lang, "モデル ID", "Model ID"));
+                        let field = ui
+                            .add(egui::TextEdit::singleline(&mut self.claude_model_edit).desired_width(220.0))
+                            .on_hover_text(tr(
+                                lang,
+                                "一覧にないモデルを使うときに直接入力する（Enter で確定）",
+                                "Type a model that is not in the list (Enter to apply)",
+                            ));
+                        let t = &mut self.persisted.translate;
+                        if field.lost_focus() && self.claude_model_edit.trim() != t.claude_model {
+                            let id = self.claude_model_edit.trim().to_string();
+                            if !id.is_empty() {
+                                t.claude_model = id;
                             }
+                            self.claude_model_edit = t.claude_model.clone();
                         }
                     });
-                    if self.claude_model_edit.is_empty() {
-                        self.claude_model_edit = t.claude_model.clone();
-                    }
-                    let field = ui
-                        .add(egui::TextEdit::singleline(&mut self.claude_model_edit).desired_width(210.0))
-                        .on_hover_text("モデル ID を直接入力できる（Enter で確定）");
-                    if field.lost_focus() && self.claude_model_edit.trim() != t.claude_model {
-                        let id = self.claude_model_edit.trim().to_string();
-                        if !id.is_empty() {
-                            t.claude_model = id;
-                            changed = true;
-                        }
-                        self.claude_model_edit = t.claude_model.clone();
-                    }
                 }
                 Engine::Codex => {
-                    let t = &mut self.persisted.translate;
-                    let name = self
-                        .codex_models
-                        .iter()
-                        .find(|m| m.id == t.codex_model)
-                        .map_or(t.codex_model.as_str(), |m| m.name.as_str());
-                    egui::ComboBox::from_id_salt("codex-model").selected_text(name).show_ui(ui, |ui| {
-                        for m in &self.codex_models {
-                            if ui.selectable_value(&mut t.codex_model, m.id.clone(), &m.name).changed() {
-                                changed = true;
-                                if !t.codex_effort.is_empty() && !m.efforts.contains(&t.codex_effort) {
-                                    t.codex_effort.clear();
-                                }
-                            }
-                        }
-                    });
-                    let efforts = self
-                        .codex_models
-                        .iter()
-                        .find(|m| m.id == t.codex_model)
-                        .map(|m| m.efforts.clone())
-                        .unwrap_or_default();
-                    let effort_label = if t.codex_effort.is_empty() {
-                        "考える強さ: 既定".to_string()
-                    } else {
-                        format!("考える強さ: {}", t.codex_effort)
-                    };
-                    egui::ComboBox::from_id_salt("codex-effort").selected_text(effort_label).show_ui(ui, |ui| {
-                        changed |= ui.selectable_value(&mut t.codex_effort, String::new(), "既定").changed();
-                        for e in efforts {
-                            changed |= ui.selectable_value(&mut t.codex_effort, e.clone(), e).changed();
-                        }
-                    });
-                    if ui.small_button("更新").on_hover_text("Codex で使えるモデルの一覧を取り直す").clicked() {
+                    self.auth_row(ui, Engine::Codex);
+                    if ui.button(tr(lang, "モデル一覧を更新", "Refresh models")).clicked() {
                         self.fetch_codex_models(ui.ctx());
                     }
                 }
-                Engine::Off => {}
-            }
-            if changed {
-                if let Ok(mut s) = self.shared.lock() {
-                    *s = self.persisted.translate.clone();
+                Engine::Off => {
+                    ui.colored_label(
+                        APP_SHELL_WEAK_TEXT,
+                        tr(lang, "翻訳しない設定です。翻訳先は上の欄で選べます。", "Translation is off. Choose an engine above."),
+                    );
                 }
-                let t = &self.persisted.translate;
-                let reload = match t.engine {
-                    Engine::Ollama => before_engine != Engine::Ollama || before_model != t.ollama_model,
-                    Engine::Claude => before_engine != Engine::Claude || before_claude != t.claude_model,
-                    Engine::Codex => {
-                        before_engine != Engine::Codex || before_codex != (t.codex_model.clone(), t.codex_effort.clone())
+            });
+            settings_section(ui, tr(lang, "ウィンドウ", "Window"), |ui| {
+                if ui.checkbox(&mut self.persisted.always_on_top, tr(lang, "最前面に固定", "Keep on top")).changed() {
+                    ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
+                }
+            });
+            settings_section(ui, tr(lang, "会話履歴の保存先", "History folder"), |ui| {
+                let dir = history::history_dir(self.persisted.history_dir.as_deref());
+                ui.label(history::display_dir(&dir));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(tr(lang, "保存先を選ぶ…", "Choose folder…")).clicked() {
+                        let title = tr(lang, "会話履歴の保存先", "History folder");
+                        if let Some(dir) = rfd::FileDialog::new().set_title(title).set_directory(&dir).pick_folder() {
+                            self.persisted.history_dir = Some(dir);
+                        }
                     }
-                    Engine::Off => false,
-                };
-                // Leaving an Ollama model (another model, or another engine) frees its memory first, so two large
-                // models are never resident together; the new model is loaded once the memory is free.
-                let left_ollama_model = before_engine == Engine::Ollama
-                    && (self.persisted.translate.engine != Engine::Ollama
-                        || self.persisted.translate.ollama_model != before_model);
-                let warm_up_now = self.running() && reload;
-                if left_ollama_model {
-                    self.release_ollama(ui.ctx(), "モデル切り替え", warm_up_now);
-                } else if warm_up_now {
-                    let ctx = ui.ctx().clone();
-                    pipeline::warm_up(self.shared.clone(), self.tx.clone(), move || ctx.request_repaint());
+                    if self.persisted.history_dir.is_some() && ui.button(tr(lang, "デスクトップに戻す", "Use Desktop")).clicked() {
+                        self.persisted.history_dir = None;
+                    }
+                });
+            });
+            settings_section(ui, tr(lang, "表示", "Appearance"), |ui| {
+                let change = show_app_shell_preferences(ui, &mut self.preferences, self.system_language, "main-settings");
+                if change.changed {
+                    apply_app_shell_preferences(ui.ctx(), self.preferences);
                 }
+            });
+            ui.add_space(4.0);
+            if ui.button(tr(lang, "字幕に戻る", "Back to subtitles")).clicked() {
+                self.settings_open = false;
             }
         });
-        self.poll_auth();
-        self.poll_notices();
-        let engine = self.persisted.translate.engine;
-        if matches!(engine, Engine::Claude | Engine::Codex) {
-            let unknown = matches!(engine, Engine::Claude if self.claude_auth == Auth::Unknown)
-                || matches!(engine, Engine::Codex if self.codex_auth == Auth::Unknown);
-            if unknown {
-                self.check_auth(engine, ui.ctx());
-            }
-            self.auth_row(ui, engine);
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui.checkbox(&mut self.persisted.always_on_top, "最前面に固定").changed() {
-                ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
-            }
-            ui.checkbox(&mut self.persisted.show_original, "原文も表示");
-            if ui
-                .add_enabled(!self.lines.is_empty(), egui::Button::new("会話履歴を保存"))
-                .on_hover_text("いまの字幕（原文・訳・時刻）を、日時つきのテキストファイルに保存する")
-                .clicked()
-            {
-                self.save_conversation();
-            }
-            if ui.button("保存先を選ぶ…").on_hover_text("会話履歴を保存するフォルダを選ぶ（既定はデスクトップ）").clicked() {
-                let start = history::history_dir(self.persisted.history_dir.as_deref());
-                if let Some(dir) = rfd::FileDialog::new().set_title("会話履歴の保存先").set_directory(start).pick_folder() {
-                    self.persisted.history_dir = Some(dir);
+    }
+
+    /// The bar under the subtitles: what to show, and what to do with the subtitles gathered so far.
+    fn actions(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            center_on_buttons(ui);
+            ui.checkbox(&mut self.persisted.show_original, tr(lang, "原文も表示", "Show original"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let any = !self.lines.is_empty();
+                if ui.add_enabled(any, egui::Button::new(tr(lang, "クリア", "Clear"))).clicked() {
+                    self.lines.clear();
                 }
-            }
-            if ui
-                .button("帯にする")
-                .on_hover_text("字幕だけの軽量表示にする。ドラッグで移動、端でサイズ変更。ESC で元に戻る")
-                .clicked()
-            {
-                let _ = self.enter_band(ui.ctx());
-            }
-            if ui.button("クリア").clicked() {
-                self.lines.clear();
-            }
-            if ui.button("コピー").clicked() {
-                ui.ctx().copy_text(self.copy_text());
-            }
+                if ui
+                    .add_enabled(any, egui::Button::new(tr(lang, "コピー", "Copy")))
+                    .on_hover_text(tr(lang, "字幕をすべてクリップボードにコピーする", "Copy all subtitles to the clipboard"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(self.copy_text());
+                }
+                if ui
+                    .add_enabled(any, egui::Button::new(tr(lang, "履歴を保存", "Save")))
+                    .on_hover_text(tr(
+                        lang,
+                        "いまの字幕（原文・訳・時刻）を、日時つきのテキストファイルに保存する（保存先は「設定」で選ぶ）",
+                        "Save the subtitles so far (original, translation, time) to a dated text file (folder in Settings)",
+                    ))
+                    .clicked()
+                {
+                    self.save_conversation();
+                }
+            });
         });
-        egui::CollapsingHeader::new("表示設定").show(ui, |ui| {
-            let change = show_app_shell_preferences(ui, &mut self.preferences, AppShellLanguage::Japanese, "main-settings");
-            if change.changed {
-                apply_app_shell_preferences(ui.ctx(), self.preferences);
-            }
-        });
+        ui.add_space(2.0);
     }
 
     /// Switches to the compact subtitle view. Returns false when the window geometry is not known yet
@@ -874,14 +1042,18 @@ impl App {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "字幕を待っています　ドラッグで移動・端でサイズ変更・ESC で元に戻る",
+                    tr(
+                        self.lang,
+                        "字幕を待っています　ドラッグで移動・端でサイズ変更・ESC で元に戻る",
+                        "Waiting for subtitles · drag to move · drag the edges to resize · Esc to return",
+                    ),
                     egui::FontId::proportional((size * 0.9).max(12.0)),
                     egui::Color32::WHITE.gamma_multiply(0.85),
                 );
             }
             if (alpha > 0.05 || finding) && ui.rect_contains_pointer(rect) {
                 let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 6.0), egui::vec2(144.0, 24.0));
-                if ui.put(button, egui::Button::new("元に戻す（ESC）").small()).clicked() {
+                if ui.put(button, egui::Button::new(tr(self.lang, "元に戻す（ESC）", "Return (Esc)")).small()).clicked() {
                     exit = true;
                 }
             }
@@ -892,14 +1064,18 @@ impl App {
     }
 
     fn subtitles(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let body = egui::TextStyle::Body.resolve(ui.style()).size;
+        if self.lines.is_empty() {
+            let hint = if self.running() {
+                tr(lang, "音声を待っています…", "Waiting for sound…")
+            } else {
+                tr(lang, "「開始」を押すと、Mac で鳴っている音を字幕にします。", "Press Start to subtitle the sound playing on this Mac.")
+            };
+            ui.centered_and_justified(|ui| ui.colored_label(APP_SHELL_WEAK_TEXT, hint));
+            return;
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            if self.lines.is_empty() {
-                ui.colored_label(
-                    APP_SHELL_WEAK_TEXT,
-                    if self.running() { "音声を待っています…" } else { "「開始」を押すと、Mac で鳴っている音を字幕にします。" },
-                );
-            }
             for line in &self.lines {
                 let big = |t: &str| egui::RichText::new(t).size(body * 1.3).strong();
                 match &line.japanese {
@@ -907,10 +1083,10 @@ impl App {
                         ui.label(big(ja));
                     }
                     Japanese::Pending => {
-                        ui.colored_label(APP_SHELL_WEAK_TEXT, "翻訳中…");
+                        ui.colored_label(APP_SHELL_WEAK_TEXT, tr(lang, "翻訳中…", "Translating…"));
                     }
                     Japanese::Failed(e) => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), format!("翻訳失敗: {e}"));
+                        ui.colored_label(ERROR_RED, format!("{}: {e}", tr(lang, "翻訳失敗", "Translation failed")));
                     }
                     Japanese::NotNeeded => {
                         ui.label(big(&line.original));
@@ -923,6 +1099,41 @@ impl App {
             }
         });
     }
+}
+
+fn tr(lang: AppShellLanguage, japanese: &'static str, english: &'static str) -> &'static str {
+    match lang {
+        AppShellLanguage::Japanese => japanese,
+        AppShellLanguage::English => english,
+    }
+}
+
+/// The first of the user's preferred macOS languages decides "System": Japanese when it is Japanese, else English.
+fn system_language() -> AppShellLanguage {
+    let preferred = objc2_foundation::NSLocale::preferredLanguages();
+    match preferred.firstObject() {
+        Some(first) if first.to_string().starts_with("ja") => AppShellLanguage::Japanese,
+        _ => AppShellLanguage::English,
+    }
+}
+
+/// Makes a row as tall as a button from the start, so labels, check boxes, buttons and drop-downs share one centre
+/// line. Without it a drop-down (which sits in its own nested row that starts `interact_size.y` tall and grows
+/// downward) ends up below the line, and a check box above it.
+fn center_on_buttons(ui: &mut egui::Ui) {
+    let height = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+    ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(height);
+    ui.set_row_height(ui.spacing().interact_size.y);
+}
+
+/// A titled group in the settings.
+fn settings_section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(title).strong());
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
 }
 
 fn band_job(text: &str, size: f32, color: egui::Color32, rows: usize, width: f32) -> egui::text::LayoutJob {
@@ -950,6 +1161,7 @@ fn level_command(on_top: bool) -> egui::ViewportCommand {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.lang = self.preferences.language.resolve(self.system_language);
         self.drain_events(ui.input(|i| i.unstable_dt).min(0.1));
         if self.band.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.exit_band(ui.ctx());
@@ -966,8 +1178,15 @@ impl eframe::App for App {
         if band_active {
             self.band_ui(ui);
         } else {
+            let before = self.persisted.translate.clone();
             egui::Panel::top("controls").show_inside(ui, |ui| self.controls(ui));
-            egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
+            if self.settings_open {
+                egui::CentralPanel::default().show_inside(ui, |ui| self.settings(ui));
+            } else {
+                egui::Panel::bottom("actions").show_inside(ui, |ui| self.actions(ui));
+                egui::CentralPanel::default().show_inside(ui, |ui| self.subtitles(ui));
+            }
+            self.apply_translate_change(ui.ctx(), &before);
         }
     }
 

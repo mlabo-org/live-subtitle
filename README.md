@@ -14,10 +14,12 @@ system audio ─ ScreenCaptureKit ─ auto gain ─ utterance ─ whisper.cpp (M
 - Translation goes sentence by sentence. An utterance ends at a short pause or at the 10 s cap, often mid-sentence, so the unfinished end is shown in the original right away and held until the next utterance completes the sentence; then the whole sentence is translated (after a 2 s pause, or 15 s in any case, it is translated as it is). Translated fragment by fragment, the Japanese trails off ("そして、そこには…").
 - The translator is told the text is transcribed talk, and asked to drop fillers (like, you know) and false starts, to use natural Japanese word order, and never to end a line with "…".
 - Japanese speech is shown as is, without translation.
-- An input level meter sits at the top of the window (green; yellow when loud; gray with "無音" when silent). It shows the level after automatic gain control; hover the bar to see the applied gain (dB).
-- Press "会話履歴を保存" (save conversation) to write the current subtitles (original, translation, time) to a timestamped text file and reveal it in Finder. Nothing is saved unless you press it. The default folder is the Desktop (file name `Live Subtitle <date> <time>.txt`); "保存先を選ぶ…" (choose folder) lets you pick any folder, and the choice is remembered ("デスクトップに戻す" returns to the default). macOS may ask for access to that folder the first time.
+- The window has three parts. The top row holds Start/Stop, "帯にする" (Caption bar), "設定" (Settings) and the translation engine and model; the subtitles fill the middle; the bottom row holds "原文も表示" (Show original), "履歴を保存" (Save), "コピー" (Copy) and "クリア" (Clear). What you rarely change (refreshing the model list, freeing memory, keeping the window on top, the history folder, and theme, language, font and text size) is gathered in Settings, which takes the place of the subtitles while open.
+- The window speaks Japanese or English: Settings → Appearance (表示) → Language (言語). "System" follows the macOS language (English unless it is Japanese). Error messages coming back from the translators and the audio capture stay in Japanese, and the subtitles are translated into Japanese either way.
+- While running, a thin input level bar sits under the top row (green; yellow when loud; gray when silent, with "無音" (Silent) shown above it). It shows the level after automatic gain control; hover the bar to see the applied gain (dB).
+- Press "履歴を保存" (Save) to write the current subtitles (original, translation, time) to a timestamped text file and reveal it in Finder. Nothing is saved unless you press it. The default folder is the Desktop (file name `Live Subtitle <date> <time>.txt`); "保存先を選ぶ…" (Choose folder…) in Settings lets you pick any folder, and the choice is remembered ("デスクトップに戻す" (Use Desktop) returns to the default). macOS may ask for access to that folder the first time.
 - While models load (whisper, Ollama), the window shows a "…モデル読み込み中" (loading model) message.
-- The window stays on top by default (toggle available).
+- The window stays on top by default ("最前面に固定" (Keep on top) in Settings turns it off).
 - "帯にする" (make a band) switches to a compact subtitle-only view, like a TV caption: a borderless, translucent strip that opens **centered on where the normal window was, and as wide as it was** (to match a video's width, resize the normal window first). The previous position is deliberately not reused, because a band that reappears at an old position gets lost. For the first 10 seconds its frame blinks yellow so you can find it. Drag it anywhere and drag its edges to resize it (the text scales with the band's height; only the height is remembered). It fades out when nothing is being said and floats over full-screen video as well. **Esc** (or the "元に戻す" restore button that appears on hover) returns to the normal window at its original size and position. Esc works only while the band has focus (click the band to focus it).
 
 ## Let an AI agent build it for you
@@ -113,7 +115,7 @@ If macOS asks for anything else (folder access and the like), just read the prom
 | Sound is playing but the meter stays at "無音" (silent) / no subtitles | Check the permission first. Also remember that the app's own sound is excluded from capture, and that a quiet source is lifted by the automatic gain control |
 | Subtitles lag | It depends on the backend and model: Ollama and Claude take about 1–2 s, Codex about 2–5 s. With Codex pick a lighter model such as Luna or Terra. A line that waits more than 10 s for a translator is shown untranslated |
 | The first subtitle after starting is slow | The model is loading (Ollama about 13 s, Claude about 1.3 s, Codex about 5 s). Wait while "…モデル読み込み中" is shown |
-| Your Mac uses 50 GB+ of memory | A large Ollama model is loaded. Press "メモリ解放" (it is also released automatically at start, at exit and on a model switch; what a forced kill left behind is cleared at the next launch) |
+| Your Mac uses 50 GB+ of memory | A large Ollama model is loaded. Press "メモリ解放" (Free memory) in Settings (it is also released automatically at start, at exit and on a model switch; what a forced kill left behind is cleared at the next launch) |
 | Your Mac's sound suddenly got loud while testing | The app never changes the Mac's output volume or the signal sent to your speakers; the automatic gain control touches only the captured copy. The loudness seen during development came from full-level test sounds (`say`, `afplay`), not from the app's gain |
 | You lost the band | For the first 10 seconds its frame blinks yellow. Click the band to focus it, then press Esc or the restore button to return to the normal window. Esc works only while the band has focus |
 | Claude sign-in does not finish | If the browser flow does not complete by itself, run `claude auth login` in a terminal (the Claude sign-in action itself was not verified on the author's Mac) |
@@ -145,7 +147,7 @@ Codex is reached through the App Server only; neither `codex exec` nor the inter
 
 A large model uses tens of GB of memory. The app frees it the same way [Taceta](https://github.com/mlabo-org/taceta) (a native macOS client for local inference) does with its "release all models" button (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them).
 
-- When you press the "メモリ解放" (release memory) button
+- When you press the "メモリ解放" (Free memory) button in Settings
 - When the app starts (to clear what an abnormal exit left behind)
 - When the app quits
 - When you switch the Ollama model, or switch the engine away from Ollama (the new model is loaded only after the memory is free)
@@ -175,7 +177,7 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 | `LIVE_SUBTITLE_CODEX` | path of the `codex` executable (started as `codex app-server`) |
 | `OLLAMA_HOST` | where Ollama listens |
 | `LIVE_SUBTITLE_AUTOSTART` | when set, start listening as soon as the app starts |
-| `LIVE_SUBTITLE_HISTORY_DIR` | folder for "会話履歴を保存" (a folder chosen in the window takes precedence) |
+| `LIVE_SUBTITLE_HISTORY_DIR` | folder for "履歴を保存" (Save) (a folder chosen in Settings takes precedence) |
 | `LIVE_SUBTITLE_AUTOBAND` | when set, start in band (caption) mode |
 | `LIVE_SUBTITLE_DEBUG_LOG` | append input level, segmentation, recognition and translation timings to this path |
 
