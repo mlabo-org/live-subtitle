@@ -1,8 +1,8 @@
 //! Translation through long-lived `claude -p` processes (stream-json in and out).
 //!
 //! Starting `claude` takes seconds, so a process is kept running and every subtitle line is one more
-//! message to it. Extended thinking is off, and the reply is taken as soon as its stream ends instead of
-//! waiting for the final result message. One process translates one line at a time, which is slower than
+//! message to it. Extended thinking is turned off where the model allows it (Haiku 5.5 always thinks
+//! briefly), and the reply is taken as soon as its stream ends instead of waiting for the final result message. One process translates one line at a time, which is slower than
 //! people talk, so up to `SESSIONS` of them run side by side; the second and third start only when a line
 //! finds the others busy. The conversation grows with every message, so a session is replaced after
 //! `RECYCLE_AFTER` lines; the replacement is prepared in the background beforehand.

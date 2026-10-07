@@ -11,16 +11,17 @@ use std::time::{Duration, Instant};
 /// Claude models offered in the window: an explicit version, a short label in Japanese and in English. Aliases
 /// such as "haiku" are avoided because the version they point at changes with the CLI.
 pub const CLAUDE_MODELS: [(&str, &str, &str); 4] = [
-    ("claude-haiku-4-5-20251001", "Haiku 4.5（最速・約0.7秒）", "Haiku 4.5 (fastest, ~0.7 s)"),
+    ("claude-haiku-5-5", "Haiku 5.5（最速・約0.7秒）", "Haiku 5.5 (fastest, ~0.7 s)"),
     ("claude-sonnet-5-5", "Sonnet 5.5（自然・約1.7秒）", "Sonnet 5.5 (natural, ~1.7 s)"),
     ("claude-opus-5-5", "Opus 5.5（自然・約2秒）", "Opus 5.5 (natural, ~2 s)"),
     ("claude-fable-5-1", "Fable 5.1（高品質・約0.8秒）", "Fable 5.1 (high quality, ~0.8 s)"),
 ];
 
-/// Settings saved by earlier builds stored an alias; this returns the explicit model it stood for.
+/// Settings saved by earlier builds stored an alias or the retired Haiku 4.5 default; this returns the explicit
+/// model that now stands in for it.
 pub fn explicit_claude_model(stored: &str) -> String {
     match stored {
-        "haiku" => CLAUDE_MODELS[0].0,
+        "haiku" | "claude-haiku-4-5-20251001" => CLAUDE_MODELS[0].0,
         "sonnet" => CLAUDE_MODELS[1].0,
         "opus" => CLAUDE_MODELS[2].0,
         other => other,

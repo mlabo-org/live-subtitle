@@ -127,7 +127,7 @@ If macOS asks for anything else (folder access and the like), just read the prom
 | Choice | Measured latency | Notes |
 |---|---|---|
 | Ollama (default `gemma4:26b-mlx`) | about 0.7–2 s (only the first load takes about 13 s; it is preloaded at start) | local, offline |
-| Claude (a resident `claude -p`) | about 0.7–2 s depending on the model (only the first start takes about 1.3 s, measured with Haiku 4.5, during which "翻訳モデル読み込み中" is shown) | high quality; uses your plan's quota. Pick an explicit model version (Haiku 4.5, Sonnet 5.5, Opus 5.5, Fable 5.1) or type a model ID |
+| Claude (a resident `claude -p`) | about 0.7–2 s depending on the model (only the first start takes about 1.3 s, measured with Haiku 5.5, during which "翻訳モデル読み込み中" is shown) | high quality; uses your plan's quota. Pick an explicit model version (Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.1) or type a model ID |
 | Codex (a resident `codex app-server`) | about 2–5 s (varies a lot; only the first start takes about 5 s) | uses the ChatGPT account the local Codex is signed in to. Models come from `model/list` (what your account can use), and the reasoning effort is selectable. The default on first use is GPT-5.6-Luna at low effort |
 | No translation | — | original text only |
 
