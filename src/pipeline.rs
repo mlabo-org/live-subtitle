@@ -2,6 +2,7 @@
 
 use crate::agc::Agc;
 use crate::capture::{Capture, SAMPLE_RATE};
+use crate::sentences::{Assembler, Step};
 use crate::translate::{self, Engine, TranslateSettings};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,6 +29,8 @@ pub enum Event {
     /// RMS after automatic gain control, and the gain currently applied.
     Level { rms: f32, gain_db: f32 },
     Heard { id: u64, lang: String, text: String },
+    /// The original text of a line already heard grew into a whole sentence (or was cut back to one).
+    Revised { id: u64, text: String },
     Translated { id: u64, text: String },
     TranslateFailed { id: u64, error: String },
     Fatal(String),
@@ -232,6 +235,11 @@ impl Segmenter {
         )
     }
 
+    /// Whether an utterance is being collected right now.
+    fn speaking(&self) -> bool {
+        self.in_speech
+    }
+
     fn reset(&mut self) {
         self.frames.clear();
         self.probabilities.clear();
@@ -378,10 +386,15 @@ fn run_asr(
 
     let context: Arc<Mutex<VecDeque<String>>> = Arc::default();
     let mut seg = Segmenter::new()?;
+    let mut sentences = Assembler::default();
     let mut last_text = String::new();
     let mut tick = std::time::Instant::now();
+    let send = |step| send_step(step, &context, &settings, tx, repaint);
 
     while !stop.load(Ordering::Relaxed) {
+        if sentences.due(std::time::Instant::now(), seg.speaking()) {
+            sentences.flush().into_iter().for_each(send);
+        }
         let leveled = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -428,38 +441,70 @@ fn run_asr(
             let lang = whisper_rs::get_lang_str(state.full_lang_id_from_state())
                 .unwrap_or("??")
                 .to_string();
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             debug_log(&format!("heard [{lang}] {text}"));
-            let _ = tx.send(Event::Heard { id, lang: lang.clone(), text: text.clone() });
-            repaint();
-
-            let ctx_lines: Vec<String> = context.lock().map(|c| c.iter().cloned().collect()).unwrap_or_default();
-            if let Ok(mut c) = context.lock() {
-                c.push_back(text.clone());
-                if c.len() > 3 {
-                    c.pop_front();
-                }
+            let off = settings.lock().is_ok_and(|s| s.engine == Engine::Off);
+            if lang == "ja" || off {
+                // Nothing to translate, so nothing is held back: the line shows as it was heard.
+                sentences.flush().into_iter().for_each(send);
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                send(Step::Show { id, lang, text });
+            } else {
+                let next_id = || NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                sentences.hear(&lang, &text, next_id, std::time::Instant::now()).into_iter().for_each(send);
             }
-            let (tx, settings, repaint) = (tx.clone(), settings.clone(), repaint.clone());
-            std::thread::spawn(move || {
-                let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
-                if s.engine == Engine::Off || lang == "ja" {
-                    return;
-                }
-                let t0 = std::time::Instant::now();
-                let ev = match translate::translate(&s, &text, &lang, &ctx_lines) {
-                    Ok(text) => {
-                        debug_log(&format!("translated in {:.2}s: {text}", t0.elapsed().as_secs_f32()));
-                        Event::Translated { id, text }
-                    }
-                    Err(error) => Event::TranslateFailed { id, error },
-                };
-                let _ = tx.send(ev);
-                repaint();
-            });
         }
     }
+    // A sentence still waiting when listening stops is translated as it is; its translation may land after stop.
+    sentences.flush().into_iter().for_each(send);
     Ok(())
+}
+
+
+/// Carries out one step of the sentence assembler: shows or revises a line, or translates it on its own thread.
+fn send_step(
+    step: Step,
+    context: &Arc<Mutex<VecDeque<String>>>,
+    settings: &SharedSettings,
+    tx: &Sender<Event>,
+    repaint: &(impl Fn() + Send + Sync + Clone + 'static),
+) {
+    let (id, lang, text) = match step {
+        Step::Show { id, lang, text } => {
+            let _ = tx.send(Event::Heard { id, lang, text });
+            repaint();
+            return;
+        }
+        Step::Revise { id, text } => {
+            let _ = tx.send(Event::Revised { id, text });
+            repaint();
+            return;
+        }
+        Step::Translate { id, lang, text } => (id, lang, text),
+    };
+    let ctx_lines: Vec<String> = context.lock().map(|c| c.iter().cloned().collect()).unwrap_or_default();
+    if let Ok(mut c) = context.lock() {
+        c.push_back(text.clone());
+        if c.len() > 3 {
+            c.pop_front();
+        }
+    }
+    let (tx, settings, repaint) = (tx.clone(), settings.clone(), repaint.clone());
+    std::thread::spawn(move || {
+        let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
+        if s.engine == Engine::Off || lang == "ja" {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let ev = match translate::translate(&s, &text, &lang, &ctx_lines) {
+            Ok(text) => {
+                debug_log(&format!("translated in {:.2}s: {text}", t0.elapsed().as_secs_f32()));
+                Event::Translated { id, text }
+            }
+            Err(error) => Event::TranslateFailed { id, error },
+        };
+        let _ = tx.send(ev);
+        repaint();
+    });
 }
 
 #[cfg(test)]

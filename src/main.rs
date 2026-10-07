@@ -7,6 +7,7 @@ mod claude;
 mod codex;
 mod history;
 mod pipeline;
+mod sentences;
 mod translate;
 
 use app_shell_foundation::{
@@ -435,6 +436,11 @@ impl App {
                     self.last_line_at = Some(Instant::now());
                     if self.lines.len() > MAX_LINES {
                         self.lines.remove(0);
+                    }
+                }
+                Event::Revised { id, text } => {
+                    if let Some(line) = self.lines.iter_mut().rev().find(|l| l.id == id) {
+                        line.original = text;
                     }
                 }
                 Event::Translated { id, text } => {

@@ -11,6 +11,8 @@ system audio ─ ScreenCaptureKit ─ auto gain ─ utterance ─ whisper.cpp (M
 ```
 
 - The original text appears immediately; the Japanese translation is filled in as soon as it is ready, so a slow translation never stalls the subtitles.
+- Translation goes sentence by sentence. An utterance ends at a short pause or at the 10 s cap, often mid-sentence, so the unfinished end is shown in the original right away and held until the next utterance completes the sentence; then the whole sentence is translated (after a 2 s pause, or 15 s in any case, it is translated as it is). Translated fragment by fragment, the Japanese trails off ("そして、そこには…").
+- The translator is told the text is transcribed talk, and asked to drop fillers (like, you know) and false starts, to use natural Japanese word order, and never to end a line with "…".
 - Japanese speech is shown as is, without translation.
 - An input level meter sits at the top of the window (green; yellow when loud; gray with "無音" when silent). It shows the level after automatic gain control; hover the bar to see the applied gain (dB).
 - Press "会話履歴を保存" (save conversation) to write the current subtitles (original, translation, time) to a timestamped text file and reveal it in Finder. Nothing is saved unless you press it. The default folder is the Desktop (file name `Live Subtitle <date> <time>.txt`); "保存先を選ぶ…" (choose folder) lets you pick any folder, and the choice is remembered ("デスクトップに戻す" returns to the default). macOS may ask for access to that folder the first time.
@@ -183,6 +185,7 @@ If Ollama is not running, the app does not start it (nothing is considered loade
 - `src/agc.rs` automatic gain control (fast attack, slow release envelope)
 - `src/history.rs` saving the conversation to a file (only when the button is pressed)
 - `src/pipeline.rs` utterance splitting (Silero VAD finds the speech, forced split at 10 s), whisper, translation threads
+- `src/sentences.rs` joins recognized utterances into sentences before they are translated
 - `assets/vad/` the voice activity detection model (embedded in the app)
 - `src/translate.rs` backend switching and Ollama
 - `src/claude.rs` translation through a resident Claude CLI

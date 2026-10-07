@@ -71,12 +71,28 @@ impl Default for TranslateSettings {
     }
 }
 
+/// How the text to translate reads and how its Japanese should read, shared by every engine's prompt. The text is
+/// transcribed talk, so a word-for-word translation keeps its fillers and its English clause order.
+macro_rules! speech_style {
+    () => {
+        "The text is a speech-recognition transcript of spontaneous talk. Translate it into clear, natural Japanese \
+subtitles that read easily at a glance. Drop filler words (like, you know, kind of, I mean) and false starts, but keep \
+every point the speaker makes, and order the clauses the way natural Japanese would instead of following the source \
+word order. End each sentence with 。 or ？, never with an ellipsis (… or ...), 〜, or a dangling connective; if the \
+text breaks off, translate only what it says. The transcript may contain misheard words; where the context makes the \
+intended word clear, translate what was meant."
+    };
+}
+
 /// System prompt of the long-lived Claude and Codex sessions, where each message is one subtitle line.
-pub const SUBTITLE_PROMPT: &str = "You are a live subtitle translator. Every user message is one subtitle line written as \
-`[source-language-code] text`, sometimes after a `Context` list of preceding lines. Reply with only the natural spoken \
-Japanese translation of the `[code] text` line: no notes, no quotation marks, no language tag; never translate the \
-context lines. Keep proper nouns recognizable. If the text is already Japanese, repeat it unchanged. Earlier messages \
-are earlier subtitle lines; use them for context only.";
+pub const SUBTITLE_PROMPT: &str = concat!(
+    "You are a live subtitle translator. Every user message is one subtitle line written as \
+`[source-language-code] text`, sometimes after a `Context` list of preceding lines. Reply with only the Japanese \
+translation of the `[code] text` line: no notes, no quotation marks, no language tag; never translate the context lines. ",
+    speech_style!(),
+    " Keep proper nouns recognizable. If the text is already Japanese, repeat it unchanged. Earlier messages are \
+earlier subtitle lines; use them for context only."
+);
 
 /// One subtitle line as the long-lived Claude and Codex sessions are sent it (the form `SUBTITLE_PROMPT` describes).
 /// The preceding lines travel with it because several sessions share the work and none has seen every line.
@@ -130,9 +146,12 @@ pub fn shutdown() {
     crate::codex::shutdown();
 }
 
-const SYSTEM_PROMPT: &str = "You are a live subtitle translator. Translate the user's text into natural spoken Japanese. \
-Output only the Japanese translation, with no notes or quotation marks. \
-Keep proper nouns recognizable. If the text is already Japanese, output it unchanged.";
+const SYSTEM_PROMPT: &str = concat!(
+    "You are a live subtitle translator. Translate the user's text into Japanese. ",
+    speech_style!(),
+    " Output only the Japanese translation, with no notes or quotation marks. \
+Keep proper nouns recognizable. If the text is already Japanese, output it unchanged."
+);
 
 fn system_prompt(lang: &str, context: &[String]) -> String {
     let mut p = format!("{SYSTEM_PROMPT}\nSource language code: {lang}.");
