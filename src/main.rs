@@ -28,9 +28,12 @@ const SETTINGS_STORAGE_KEY: &str = "live-subtitle.settings.v1";
 /// eframe's own storage key for the window position and size.
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const MAX_LINES: usize = 5000;
-const BAND_VISIBLE_SECONDS: f64 = 10.0;
 const BAND_FIND_SECONDS: f32 = 10.0;
 const BAND_FIND_YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 214, 0);
+/// Small, so the rounded frame still shows where the window's corners (resize handles) are.
+const BAND_CORNER: f32 = 6.0;
+/// Width of the strip along the band's edges that resizes it.
+const BAND_EDGE: f32 = 8.0;
 const NORMAL_MIN_SIZE: [f32; 2] = [380.0, 260.0];
 const BAND_MIN_SIZE: [f32; 2] = [240.0, 70.0];
 const METER_MIN_DB: f32 = -70.0;
@@ -53,11 +56,14 @@ struct Persisted {
     /// Folder chosen for saved conversations; the Desktop when unset.
     #[serde(default)]
     history_dir: Option<std::path::PathBuf>,
+    /// How much the band's background lets the screen show through, in percent (0 is opaque).
+    #[serde(default)]
+    band_transparency: u8,
 }
 
 impl Default for Persisted {
     fn default() -> Self {
-        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_height: None, history_dir: None }
+        Self { translate: TranslateSettings::default(), always_on_top: true, show_original: true, band_height: None, history_dir: None, band_transparency: 0 }
     }
 }
 
@@ -110,9 +116,21 @@ struct Line {
 struct BandState {
     restore_pos: egui::Pos2,
     restore_size: egui::Vec2,
-    passthrough: bool,
     /// When the band opened; its frame blinks for `BAND_FIND_SECONDS` so it can be found.
     started: Instant,
+    /// The edge drag in progress, if any.
+    resizing: Option<BandResize>,
+}
+
+/// An edge drag of the band. macOS gives a borderless window only a hairline to grab, and winit cannot hand a
+/// resize to AppKit there, so the band resizes itself from a wider strip along its edges.
+struct BandResize {
+    /// Which edges move: left, right, top, bottom.
+    edges: [bool; 4],
+    /// Pointer position in macOS screen points (y up) when the drag began.
+    start_pointer: egui::Pos2,
+    /// The window's rectangle (egui coordinates) when the drag began.
+    start_rect: egui::Rect,
 }
 
 struct App {
@@ -151,7 +169,6 @@ struct App {
     band_configured: bool,
     /// Whether the level meter is on screen (not in the band); the pipeline reports levels only then.
     meter_shown: Arc<std::sync::atomic::AtomicBool>,
-    last_line_at: Option<Instant>,
     auto_band: bool,
     /// One-line result of the last "save conversation" press.
     notice: Option<String>,
@@ -205,7 +222,6 @@ impl App {
             // true on purpose: the first frame applies the ordinary (opaque) window traits.
             band_configured: true,
             meter_shown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            last_line_at: None,
             notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
@@ -480,7 +496,6 @@ impl App {
                         Japanese::Pending
                     };
                     self.lines.push(Line { id, at: chrono::Local::now(), lang, original: text, japanese });
-                    self.last_line_at = Some(Instant::now());
                     if self.lines.len() > MAX_LINES {
                         self.lines.remove(0);
                     }
@@ -492,7 +507,6 @@ impl App {
                 }
                 Event::Translated { id, text } => {
                     self.set_japanese(id, Japanese::Done(text));
-                    self.last_line_at = Some(Instant::now());
                 }
                 Event::TranslateFailed { id, error } => self.set_japanese(id, Japanese::Failed(error)),
                 Event::Fatal(e) => {
@@ -838,6 +852,15 @@ impl App {
                     );
                 }
             });
+            settings_section(ui, tr(lang, "字幕", "Subtitles"), |ui| {
+                ui.checkbox(&mut self.persisted.show_original, tr(lang, "原文も表示", "Show original"));
+            });
+            settings_section(ui, tr(lang, "帯", "Caption bar"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(tr(lang, "背景の透過率", "Background transparency"));
+                    ui.add(egui::Slider::new(&mut self.persisted.band_transparency, 0..=100).suffix(" %"));
+                });
+            });
             settings_section(ui, tr(lang, "ウィンドウ", "Window"), |ui| {
                 if ui.checkbox(&mut self.persisted.always_on_top, tr(lang, "最前面に固定", "Keep on top")).changed() {
                     ui.ctx().send_viewport_cmd(level_command(self.persisted.always_on_top));
@@ -917,7 +940,8 @@ impl App {
         let zoom = ctx.zoom_factor();
         let display = band::display_rect_containing(outer.center() * zoom);
         let display = egui::Rect::from_min_max(display.min / zoom, display.max / zoom);
-        let height = band::band_height(f32::from(self.preferences.font_size_points));
+        let (main, original) = subtitle_sizes(&ctx.global_style());
+        let height = band::band_height(main, original);
         // The band is as wide as the normal window was (resize that window to match the video), and as tall as
         // last time.
         // A remembered height is capped so the band can never come up as a huge slab.
@@ -927,8 +951,8 @@ impl App {
         self.band = Some(BandState {
             restore_pos: outer.min,
             restore_size: inner.size(),
-            passthrough: false,
             started: Instant::now(),
+            resizing: None,
         });
         self.meter_shown.store(false, std::sync::atomic::Ordering::Relaxed);
         use egui::ViewportCommand as Cmd;
@@ -956,7 +980,6 @@ impl App {
         }
         use egui::ViewportCommand as Cmd;
         for cmd in [
-            Cmd::MousePassthrough(false),
             Cmd::Decorations(true),
             Cmd::Resizable(true),
             Cmd::MinInnerSize(egui::vec2(NORMAL_MIN_SIZE[0], NORMAL_MIN_SIZE[1])),
@@ -969,17 +992,11 @@ impl App {
         }
     }
 
-    /// The telop: the newest subtitle on a translucent strip that fades out when nothing is being said.
+    /// The telop: the newest subtitle at the bottom of an always-shown strip with a hairline frame, its background
+    /// as transparent as set in the settings. The text is the size of the window's subtitles; a taller strip shows
+    /// earlier subtitles above the newest, dimmer.
     fn band_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let latest = self.lines.last();
-        let pending = matches!(latest.map(|l| &l.japanese), Some(Japanese::Pending));
-        let fresh = self.last_line_at.is_some_and(|t| t.elapsed().as_secs_f64() < BAND_VISIBLE_SECONDS);
-        let visible = latest.is_some() && (pending || fresh);
-        if latest.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
-        let alpha = ctx.animate_bool_with_time(egui::Id::new("band-visible"), visible, 0.25);
         // Right after the band opens its frame blinks yellow, so it cannot be lost on a busy screen.
         let age = self.band.as_ref().map_or(f32::MAX, |b| b.started.elapsed().as_secs_f32());
         let finding = age < BAND_FIND_SECONDS;
@@ -990,56 +1007,113 @@ impl App {
         } else {
             0.0
         };
-        // While nothing is shown the strip lets mouse clicks through to the video underneath.
-        let interactive = visible || finding;
-        if let Some(band) = &mut self.band {
-            if band.passthrough == interactive {
-                band.passthrough = !interactive;
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!interactive));
-            }
-        }
-        let size = band::unit_for_height(ctx.content_rect().height());
-        let content = latest.map(|l| {
-            let (main, color) = match &l.japanese {
-                Japanese::Done(ja) => (ja.clone(), egui::Color32::WHITE),
-                Japanese::Pending => ("…".to_string(), APP_SHELL_WEAK_TEXT),
-                Japanese::NotNeeded | Japanese::Failed(_) => (l.original.clone(), egui::Color32::WHITE),
-            };
-            let original = (self.persisted.show_original
-                && matches!(l.japanese, Japanese::Done(_) | Japanese::Pending))
-            .then(|| format!("[{}] {}", l.lang, l.original));
-            (main, color, original)
-        });
-        let content_is_none = content.is_none();
+        let (main_size, original_size) = subtitle_sizes(ui.style());
+        let show_original = self.persisted.show_original;
         let mut exit = false;
         egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
             let rect = ui.max_rect();
-            let fill = (190.0 * alpha).max(if finding { 90.0 } else { 0.0 });
-            ui.painter().rect_filled(rect, 14.0, egui::Color32::from_black_alpha(fill as u8));
+            let hovered = ui.rect_contains_pointer(rect);
+            let painter = ui.painter();
+            let opacity = 255.0 * (1.0 - f32::from(self.persisted.band_transparency.min(100)) / 100.0);
+            let fill = opacity.max(if finding { 90.0 } else { 0.0 });
+            painter.rect_filled(rect, BAND_CORNER, egui::Color32::from_black_alpha(fill as u8));
+            // A hairline frame, always, so the edges to drag for resizing can be found.
+            let frame = egui::Color32::WHITE.gamma_multiply(if hovered { 0.75 } else { 0.4 });
+            painter.rect_stroke(rect, BAND_CORNER, egui::Stroke::new(1.0, frame), egui::StrokeKind::Inside);
             if finding {
                 let stroke = egui::Stroke::new(5.0, BAND_FIND_YELLOW.gamma_multiply(0.3 + 0.7 * pulse));
-                ui.painter().rect_stroke(rect.shrink(2.5), 14.0, stroke, egui::StrokeKind::Inside);
+                painter.rect_stroke(rect.shrink(2.5), BAND_CORNER, stroke, egui::StrokeKind::Inside);
             }
             let drag = ui.interact(rect, egui::Id::new("band-drag"), egui::Sense::click_and_drag());
+            let edges_at = |p: egui::Pos2| {
+                [
+                    p.x < rect.left() + BAND_EDGE,
+                    p.x > rect.right() - BAND_EDGE,
+                    p.y < rect.top() + BAND_EDGE,
+                    p.y > rect.bottom() - BAND_EDGE,
+                ]
+            };
+            let resizing = self.band.as_ref().and_then(|b| b.resizing.as_ref()).map(|r| r.edges);
+            if let Some(icon) = resize_cursor(resizing.unwrap_or_else(|| drag.hover_pos().map_or([false; 4], edges_at))) {
+                ctx.set_cursor_icon(icon);
+            }
             if drag.drag_started() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-            if let Some((main, color, original)) = content {
-                let width = rect.width() - 48.0;
-                ui.add_space(14.0);
-                ui.vertical_centered(|ui| {
-                    ui.add(egui::Label::new(band_job(&main, size * 1.9, color.gamma_multiply(alpha), 2, width)).selectable(false));
-                    if let Some(original) = original {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(band_job(&original, size, APP_SHELL_WEAK_TEXT.gamma_multiply(alpha), 1, width))
-                                .selectable(false),
-                        );
+                // A drag starts only after the pointer has moved a little, so judge the edge where it was pressed.
+                let (origin, now) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
+                let edges = origin.map_or([false; 4], edges_at);
+                if edges.contains(&true) {
+                    if let (Some(band), Some(start_rect), Some(origin), Some(now)) =
+                        (&mut self.band, ctx.input(|i| i.viewport().outer_rect), origin, now)
+                    {
+                        // Where the pointer was pressed, in screen points (y up).
+                        let moved = (now - origin) * ctx.zoom_factor();
+                        let start_pointer = band::pointer_location() - egui::vec2(moved.x, -moved.y);
+                        band.resizing = Some(BandResize { edges, start_pointer, start_rect });
                     }
-                });
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
             }
-            if finding && content_is_none {
-                ui.painter().text(
+            if let Some(band) = &mut self.band {
+                if drag.dragged() {
+                    if let Some(r) = &band.resizing {
+                        // Screen points are y-up; egui's window coordinates are y-down and divided by the UI zoom.
+                        let moved = band::pointer_location() - r.start_pointer;
+                        let delta = egui::vec2(moved.x, -moved.y) / ctx.zoom_factor();
+                        let [left, right, top, bottom] = r.edges;
+                        let mut new = r.start_rect;
+                        let min = egui::vec2(BAND_MIN_SIZE[0], BAND_MIN_SIZE[1]);
+                        if left {
+                            new.min.x = (new.min.x + delta.x).min(new.max.x - min.x);
+                        }
+                        if right {
+                            new.max.x = (new.max.x + delta.x).max(new.min.x + min.x);
+                        }
+                        if top {
+                            new.min.y = (new.min.y + delta.y).min(new.max.y - min.y);
+                        }
+                        if bottom {
+                            new.max.y = (new.max.y + delta.y).max(new.min.y + min.y);
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new.min));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(new.size()));
+                    }
+                }
+                if !drag.dragged() {
+                    band.resizing = None;
+                }
+            }
+            // From the newest subtitle at the bottom upward, as many as fit.
+            let width = rect.width() - 48.0;
+            let left = rect.left() + 24.0;
+            let top = rect.top() + 10.0;
+            let mut bottom = rect.bottom() - 12.0;
+            for (i, line) in self.lines.iter().rev().enumerate() {
+                let dim = if i == 0 { 1.0 } else { 0.55 };
+                let (main, color) = match &line.japanese {
+                    Japanese::Done(ja) => (ja.as_str(), egui::Color32::WHITE),
+                    Japanese::Pending => ("…", APP_SHELL_WEAK_TEXT),
+                    Japanese::NotNeeded | Japanese::Failed(_) => (line.original.as_str(), egui::Color32::WHITE),
+                };
+                let main = painter.layout_job(band_job(main, main_size, color.gamma_multiply(dim), 2, width));
+                let original = (show_original && matches!(line.japanese, Japanese::Done(_) | Japanese::Pending)).then(|| {
+                    let text = format!("[{}] {}", line.lang, line.original);
+                    painter.layout_job(band_job(&text, original_size, APP_SHELL_WEAK_TEXT.gamma_multiply(dim), 1, width))
+                });
+                let height = main.size().y + original.as_ref().map_or(0.0, |g| 4.0 + g.size().y);
+                if i > 0 && bottom - height < top {
+                    break;
+                }
+                let y = bottom - height;
+                let original_y = y + main.size().y + 4.0;
+                painter.galley(egui::pos2(left, y), main, egui::Color32::WHITE);
+                if let Some(original) = original {
+                    painter.galley(egui::pos2(left, original_y), original, egui::Color32::WHITE);
+                }
+                bottom = y - original_size * 0.6;
+            }
+            if finding && self.lines.is_empty() {
+                painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     tr(
@@ -1047,11 +1121,11 @@ impl App {
                         "字幕を待っています　ドラッグで移動・端でサイズ変更・ESC で元に戻る",
                         "Waiting for subtitles · drag to move · drag the edges to resize · Esc to return",
                     ),
-                    egui::FontId::proportional((size * 0.9).max(12.0)),
+                    egui::FontId::proportional(original_size),
                     egui::Color32::WHITE.gamma_multiply(0.85),
                 );
             }
-            if (alpha > 0.05 || finding) && ui.rect_contains_pointer(rect) {
+            if hovered {
                 let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 6.0), egui::vec2(144.0, 24.0));
                 if ui.put(button, egui::Button::new(tr(self.lang, "元に戻す（ESC）", "Return (Esc)")).small()).clicked() {
                     exit = true;
@@ -1065,7 +1139,7 @@ impl App {
 
     fn subtitles(&self, ui: &mut egui::Ui) {
         let lang = self.lang;
-        let body = egui::TextStyle::Body.resolve(ui.style()).size;
+        let (main_size, original_size) = subtitle_sizes(ui.style());
         if self.lines.is_empty() {
             let hint = if self.running() {
                 tr(lang, "音声を待っています…", "Waiting for sound…")
@@ -1077,7 +1151,7 @@ impl App {
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             for line in &self.lines {
-                let big = |t: &str| egui::RichText::new(t).size(body * 1.3).strong();
+                let big = |t: &str| egui::RichText::new(t).size(main_size).strong();
                 match &line.japanese {
                     Japanese::Done(ja) => {
                         ui.label(big(ja));
@@ -1095,9 +1169,28 @@ impl App {
                 if self.persisted.show_original && !matches!(line.japanese, Japanese::NotNeeded) {
                     ui.colored_label(APP_SHELL_WEAK_TEXT, format!("[{}] {}", line.lang, line.original));
                 }
-                ui.add_space(body * 0.6);
+                ui.add_space(original_size * 0.6);
             }
         });
+    }
+}
+
+/// Text sizes of a subtitle (the translation, and the original under it), the same in the window and in the band.
+/// Both follow the text-size setting through the UI zoom.
+fn subtitle_sizes(style: &egui::Style) -> (f32, f32) {
+    let body = egui::TextStyle::Body.resolve(style).size;
+    (body * 1.3, body)
+}
+
+/// The resize cursor for the band edges `[left, right, top, bottom]` under the pointer.
+fn resize_cursor([left, right, top, bottom]: [bool; 4]) -> Option<egui::CursorIcon> {
+    use egui::CursorIcon as C;
+    match (left || right, top || bottom) {
+        (true, true) if (left && top) || (right && bottom) => Some(C::ResizeNwSe),
+        (true, true) => Some(C::ResizeNeSw),
+        (true, false) => Some(C::ResizeHorizontal),
+        (false, true) => Some(C::ResizeVertical),
+        (false, false) => None,
     }
 }
 
@@ -1147,7 +1240,6 @@ fn band_job(text: &str, size: f32, color: egui::Color32, rows: usize, width: f32
         break_anywhere: true,
         overflow_character: Some('…'),
     };
-    job.halign = egui::Align::Center;
     job
 }
 

@@ -2,7 +2,7 @@
 
 use eframe::egui::{Pos2, Rect, Vec2};
 use objc2::rc::Retained;
-use objc2_app_kit::{NSColor, NSView, NSWindow, NSWindowCollectionBehavior};
+use objc2_app_kit::{NSColor, NSEvent, NSView, NSWindow, NSWindowCollectionBehavior};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// NSStatusWindowLevel: above ordinary floating windows, so the band stays over video players.
@@ -26,9 +26,9 @@ pub fn display_rect_containing(point: Pos2) -> Rect {
         .unwrap_or_else(|| rect_of(CGDisplay::main().id))
 }
 
-/// Height of the band for the given UI font size (two lines of subtitle plus the original line).
-pub fn band_height(font_size_points: f32) -> f32 {
-    font_size_points * (1.9 * 2.7 + 1.7) + 36.0
+/// Height of the band that fits one subtitle: two lines of translation plus the original line, at these text sizes.
+pub fn band_height(main_size: f32, original_size: f32) -> f32 {
+    main_size * 2.7 + original_size * 1.7 + 36.0
 }
 
 /// The top-left corner of a window of `size` centered on `center`, kept inside `display`. The band opens
@@ -45,9 +45,10 @@ pub fn centered_on(display: Rect, center: Pos2, size: Vec2) -> Pos2 {
     )
 }
 
-/// The font-size unit that makes the band's content fill a band of this height.
-pub fn unit_for_height(height: f32) -> f32 {
-    ((height - 36.0) / (1.9 * 2.7 + 1.7)).max(8.0)
+/// The mouse pointer in macOS screen points (origin at the bottom left of the main display, y up).
+pub fn pointer_location() -> Pos2 {
+    let point = NSEvent::mouseLocation();
+    Pos2::new(point.x as f32, point.y as f32)
 }
 
 fn native_window(frame: &eframe::Frame) -> Option<Retained<NSWindow>> {
