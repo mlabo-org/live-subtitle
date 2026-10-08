@@ -11,8 +11,8 @@ pub struct Record<'a> {
     pub at: DateTime<Local>,
     pub lang: &'a str,
     pub original: &'a str,
-    /// The Japanese text, when the line was translated.
-    pub japanese: Option<&'a str>,
+    /// The translation, when the line was translated.
+    pub translation: Option<&'a str>,
     /// A note for lines whose translation is missing, e.g. "翻訳中".
     pub note: Option<String>,
 }
@@ -42,8 +42,8 @@ fn render(saved_at: DateTime<Local>, records: &[Record]) -> String {
     let mut text = format!("# Live Subtitle {}\n", saved_at.format(TIME_FORMAT));
     for r in records {
         text.push_str(&format!("\n[{}] {}\n{}\n", r.at.format(TIME_FORMAT), r.lang, r.original));
-        if let Some(ja) = r.japanese {
-            text.push_str(&format!("{ja}\n"));
+        if let Some(translation) = r.translation {
+            text.push_str(&format!("{translation}\n"));
         }
         if let Some(note) = &r.note {
             text.push_str(&format!("（{note}）\n"));
@@ -70,9 +70,9 @@ mod tests {
     fn renders_original_translation_and_notes_in_order() {
         let at = Local::now();
         let records = [
-            Record { at, lang: "en", original: "Hello there.", japanese: Some("やあ。"), note: None },
-            Record { at, lang: "ja", original: "こんにちは。", japanese: None, note: None },
-            Record { at, lang: "fr", original: "Bonjour.", japanese: None, note: Some("翻訳中".into()) },
+            Record { at, lang: "en", original: "Hello there.", translation: Some("やあ。"), note: None },
+            Record { at, lang: "ja", original: "こんにちは。", translation: None, note: None },
+            Record { at, lang: "fr", original: "Bonjour.", translation: None, note: Some("翻訳中".into()) },
         ];
         let text = render(at, &records);
         let pos = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle}: {text}"));
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn save_creates_a_new_file_in_the_directory() {
         let dir = std::env::temp_dir().join(format!("live-subtitle-history-test-{}", std::process::id()));
-        let records = [Record { at: Local::now(), lang: "en", original: "Hello there.", japanese: Some("やあ。"), note: None }];
+        let records = [Record { at: Local::now(), lang: "en", original: "Hello there.", translation: Some("やあ。"), note: None }];
         let path = save(&dir, &records).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

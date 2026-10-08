@@ -8,7 +8,7 @@
 //! `RECYCLE_AFTER` lines; the replacement is prepared in the background beforehand.
 
 use serde_json::{json, Value};
-use crate::translate::{spawn_line_reader, subtitle_message, QUEUE_LIMIT, SUBTITLE_PROMPT};
+use crate::translate::{spawn_line_reader, subtitle_message, subtitle_prompt, QUEUE_LIMIT};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -27,6 +27,8 @@ struct Session {
     stdin: ChildStdin,
     lines: Receiver<String>,
     model: String,
+    /// The code of the language the session translates into; its system prompt names it.
+    target: String,
     requests: usize,
     /// Messages whose final `result` line has not been read yet (it trails the reply by a moment).
     outstanding: usize,
@@ -60,13 +62,14 @@ impl Drop for Session {
 
 impl Session {
     /// Starts the process and sends one greeting so the first real subtitle is not slowed by the cold start.
-    fn spawn(model: &str) -> Result<Self, String> {
+    fn spawn(model: &str, target: &str) -> Result<Self, String> {
         let bin = claude_binary().ok_or("claude コマンドが見つからない（LIVE_SUBTITLE_CLAUDE で指定できる）")?;
         let mut child = Command::new(bin)
             .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json"])
             .args(["--verbose", "--include-partial-messages", "--thinking", "disabled", "--model", model])
             .args(["--tools", "", "--setting-sources", "", "--strict-mcp-config"])
-            .args(["--disable-slash-commands", "--no-session-persistence", "--system-prompt", SUBTITLE_PROMPT])
+            .args(["--disable-slash-commands", "--no-session-persistence", "--system-prompt"])
+            .arg(subtitle_prompt(target))
             .current_dir(std::env::temp_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -76,9 +79,14 @@ impl Session {
         let stdin = child.stdin.take().ok_or("stdin を開けない")?;
         let stdout = child.stdout.take().ok_or("stdout を開けない")?;
         let lines = spawn_line_reader(stdout);
-        let mut session = Self { child, stdin, lines, model: model.to_string(), requests: 0, outstanding: 0 };
+        let mut session =
+            Self { child, stdin, lines, model: model.to_string(), target: target.to_string(), requests: 0, outstanding: 0 };
         session.ask(&subtitle_message(&[], "en", "Hello."))?;
         Ok(session)
+    }
+
+    fn serves(&self, model: &str, target: &str) -> bool {
+        self.model == model && self.target == target
     }
 
     fn ask(&mut self, content: &str) -> Result<String, String> {
@@ -131,18 +139,18 @@ impl Session {
     }
 }
 
-fn take_spare(model: &str) -> Option<Session> {
+fn take_spare(model: &str, target: &str) -> Option<Session> {
     let spare = SPARE.lock().ok()?.take()?;
-    (spare.model == model).then_some(spare)
+    spare.serves(model, target).then_some(spare)
 }
 
-fn prepare_spare(model: &str) {
+fn prepare_spare(model: &str, target: &str) {
     if PREPARING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let model = model.to_string();
+    let (model, target) = (model.to_string(), target.to_string());
     std::thread::spawn(move || {
-        if let Ok(session) = Session::spawn(&model) {
+        if let Ok(session) = Session::spawn(&model, &target) {
             if let Ok(mut spare) = SPARE.lock() {
                 *spare = Some(session);
             }
@@ -151,15 +159,15 @@ fn prepare_spare(model: &str) {
     });
 }
 
-/// A slot nobody is using, waiting up to `QUEUE_LIMIT` for one. A slot whose session already runs `model` is
-/// preferred, so unhurried speech stays with one process and the others start only under load.
-fn free_slot(model: &str) -> Result<MutexGuard<'static, Option<Session>>, String> {
+/// A slot nobody is using, waiting up to `QUEUE_LIMIT` for one. A slot whose session already runs `model` for
+/// `target` is preferred, so unhurried speech stays with one process and the others start only under load.
+fn free_slot(model: &str, target: &str) -> Result<MutexGuard<'static, Option<Session>>, String> {
     let deadline = Instant::now() + QUEUE_LIMIT;
     loop {
         let mut idle = None;
         for slot in &SLOTS {
             match slot.try_lock() {
-                Ok(guard) if guard.as_ref().is_some_and(|s| s.model == model) => return Ok(guard),
+                Ok(guard) if guard.as_ref().is_some_and(|s| s.serves(model, target)) => return Ok(guard),
                 Ok(guard) => {
                     idle.get_or_insert(guard);
                 }
@@ -177,39 +185,39 @@ fn free_slot(model: &str) -> Result<MutexGuard<'static, Option<Session>>, String
     }
 }
 
-/// The slot's session for `model`, started first when none is running, or when the running one is for another
-/// model or due for replacement.
-fn current<'a>(active: &'a mut Option<Session>, model: &str) -> Result<&'a mut Session, String> {
-    if active.as_ref().is_none_or(|s| s.model != model || s.requests >= RECYCLE_AFTER) {
+/// The slot's session for `model` and `target`, started first when none is running, or when the running one is
+/// for another model or target or due for replacement.
+fn current<'a>(active: &'a mut Option<Session>, model: &str, target: &str) -> Result<&'a mut Session, String> {
+    if active.as_ref().is_none_or(|s| !s.serves(model, target) || s.requests >= RECYCLE_AFTER) {
         *active = None;
-        *active = Some(match take_spare(model) {
+        *active = Some(match take_spare(model, target) {
             Some(spare) => spare,
-            None => Session::spawn(model)?,
+            None => Session::spawn(model, target)?,
         });
     }
     active.as_mut().ok_or_else(|| "claude のセッションが無い".to_string())
 }
 
-/// Starts one session for `model` ahead of the first subtitle (starting one already sends the greeting) and
-/// stops idle sessions left over from another model.
-pub fn warm_up(model: &str) -> Result<(), String> {
+/// Starts one session for `model` and `target` ahead of the first subtitle (starting one already sends the
+/// greeting) and stops idle sessions left over from another model or target.
+pub fn warm_up(model: &str, target: &str) -> Result<(), String> {
     for slot in &SLOTS {
         if let Ok(mut session) = slot.try_lock() {
-            if session.as_ref().is_some_and(|s| s.model != model) {
+            if session.as_ref().is_some_and(|s| !s.serves(model, target)) {
                 *session = None;
             }
         }
     }
-    let mut active = free_slot(model)?;
-    current(&mut active, model).map(|_| ())
+    let mut active = free_slot(model, target)?;
+    current(&mut active, model, target).map(|_| ())
 }
 
 /// Translates one subtitle line; up to `SESSIONS` lines are translated at the same time.
-pub fn translate(model: &str, context: &[String], lang: &str, text: &str) -> Result<String, String> {
-    let mut active = free_slot(model)?;
-    let session = current(&mut active, model)?;
+pub fn translate(model: &str, target: &str, context: &[String], lang: &str, text: &str) -> Result<String, String> {
+    let mut active = free_slot(model, target)?;
+    let session = current(&mut active, model, target)?;
     if session.requests == PREPARE_AT {
-        prepare_spare(model);
+        prepare_spare(model, target);
     }
     match session.ask(&subtitle_message(context, lang, text)) {
         Ok(reply) => Ok(reply),

@@ -442,9 +442,10 @@ fn run_asr(
                 .unwrap_or("??")
                 .to_string();
             debug_log(&format!("heard [{lang}] {text}"));
-            let off = settings.lock().is_ok_and(|s| s.engine == Engine::Off);
-            if lang == "ja" || off {
-                // Nothing to translate, so nothing is held back: the line shows as it was heard.
+            let untranslated = settings.lock().is_ok_and(|s| s.engine == Engine::Off || s.target == lang);
+            if untranslated {
+                // Already in the target language, or translation is off: nothing is held back, the line shows as
+                // it was heard.
                 sentences.flush().into_iter().for_each(send);
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 send(Step::Show { id, lang, text });
@@ -491,7 +492,7 @@ fn send_step(
     let (tx, settings, repaint) = (tx.clone(), settings.clone(), repaint.clone());
     std::thread::spawn(move || {
         let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
-        if s.engine == Engine::Off || lang == "ja" {
+        if s.engine == Engine::Off || s.target == lang {
             return;
         }
         let t0 = std::time::Instant::now();

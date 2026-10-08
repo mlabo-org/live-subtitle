@@ -96,11 +96,11 @@ impl Release {
     }
 }
 
-enum Japanese {
+enum Translation {
     Pending,
     Done(String),
     Failed(String),
-    /// Spoken in Japanese already, or translation switched off.
+    /// Spoken in the target language already, or translation switched off.
     NotNeeded,
 }
 
@@ -109,7 +109,7 @@ struct Line {
     at: chrono::DateTime<chrono::Local>,
     lang: String,
     original: String,
-    japanese: Japanese,
+    translation: Translation,
 }
 
 /// Window state remembered while the band is shown, so ESC can restore the ordinary window.
@@ -177,6 +177,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_macos_system_fonts(&cc.egui_ctx).expect("the managed macOS UI font must be available");
+        install_script_fonts(&cc.egui_ctx);
         let preferences = load_app_shell_preferences(cc.storage, APP_SHELL_STORAGE_KEY);
         apply_app_shell_preferences(&cc.egui_ctx, preferences);
         let mut persisted: Persisted = cc
@@ -240,13 +241,13 @@ impl App {
             .lines
             .iter()
             .map(|l| {
-                let (japanese, note) = match &l.japanese {
-                    Japanese::Done(ja) => (Some(ja.as_str()), None),
-                    Japanese::Pending => (None, Some("翻訳中".to_string())),
-                    Japanese::Failed(e) => (None, Some(format!("翻訳失敗: {e}"))),
-                    Japanese::NotNeeded => (None, None),
+                let (translation, note) = match &l.translation {
+                    Translation::Done(t) => (Some(t.as_str()), None),
+                    Translation::Pending => (None, Some("翻訳中".to_string())),
+                    Translation::Failed(e) => (None, Some(format!("翻訳失敗: {e}"))),
+                    Translation::NotNeeded => (None, None),
                 };
-                history::Record { at: l.at, lang: &l.lang, original: &l.original, japanese, note }
+                history::Record { at: l.at, lang: &l.lang, original: &l.original, translation, note }
             })
             .collect();
         self.notice = Some(match history::save(&history::history_dir(self.persisted.history_dir.as_deref()), &records) {
@@ -489,13 +490,13 @@ impl App {
                     self.gain_db = gain_db;
                 }
                 Event::Heard { id, lang, text } => {
-                    let engine = self.persisted.translate.engine;
-                    let japanese = if lang == "ja" || engine == Engine::Off {
-                        Japanese::NotNeeded
+                    let t = &self.persisted.translate;
+                    let translation = if t.engine == Engine::Off || t.target == lang {
+                        Translation::NotNeeded
                     } else {
-                        Japanese::Pending
+                        Translation::Pending
                     };
-                    self.lines.push(Line { id, at: chrono::Local::now(), lang, original: text, japanese });
+                    self.lines.push(Line { id, at: chrono::Local::now(), lang, original: text, translation });
                     if self.lines.len() > MAX_LINES {
                         self.lines.remove(0);
                     }
@@ -506,9 +507,9 @@ impl App {
                     }
                 }
                 Event::Translated { id, text } => {
-                    self.set_japanese(id, Japanese::Done(text));
+                    self.set_translation(id, Translation::Done(text));
                 }
-                Event::TranslateFailed { id, error } => self.set_japanese(id, Japanese::Failed(error)),
+                Event::TranslateFailed { id, error } => self.set_translation(id, Translation::Failed(error)),
                 Event::Fatal(e) => {
                     self.error = Some(e);
                     self.stop();
@@ -519,9 +520,9 @@ impl App {
         self.level = frame_peak.max(self.level * (-dt / METER_RELEASE_SECONDS).exp());
     }
 
-    fn set_japanese(&mut self, id: u64, value: Japanese) {
+    fn set_translation(&mut self, id: u64, value: Translation) {
         if let Some(line) = self.lines.iter_mut().rev().find(|l| l.id == id) {
-            line.japanese = value;
+            line.translation = value;
         }
     }
 
@@ -551,8 +552,8 @@ impl App {
     fn copy_text(&self) -> String {
         self.lines
             .iter()
-            .map(|l| match &l.japanese {
-                Japanese::Done(ja) => format!("{ja}\n{}", l.original),
+            .map(|l| match &l.translation {
+                Translation::Done(t) => format!("{t}\n{}", l.original),
                 _ => l.original.clone(),
             })
             .collect::<Vec<_>>()
@@ -685,11 +686,21 @@ impl App {
         });
     }
 
-    /// The translation engine and its model (and Codex's effort). A change is handed to the pipeline by
-    /// `apply_translate_change` at the end of the frame.
+    /// The language to translate into, the translation engine and its model (and Codex's effort). A change is
+    /// handed to the pipeline by `apply_translate_change` at the end of the frame.
     fn translation_pickers(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
         let t = &mut self.persisted.translate;
+        let target = translate::target(&t.target);
+        egui::ComboBox::from_id_salt("target")
+            .selected_text(format!("→ {}", tr(lang, target.ja, target.en)))
+            .show_ui(ui, |ui| {
+                for target in &translate::TARGETS {
+                    ui.selectable_value(&mut t.target, target.code.to_string(), tr(lang, target.ja, target.en));
+                }
+            })
+            .response
+            .on_hover_text(tr(lang, "訳す言語。この言語で話された音声は、訳さずにそのまま出す", "The language to translate into. Speech already in it is shown as heard"));
         egui::ComboBox::from_id_salt("engine").selected_text(t.engine.label(lang)).show_ui(ui, |ui| {
             for e in [Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
                 ui.selectable_value(&mut t.engine, e, e.label(lang));
@@ -764,18 +775,23 @@ impl App {
             || t.ollama_model != before.ollama_model
             || t.claude_model != before.claude_model
             || t.codex_model != before.codex_model
-            || t.codex_effort != before.codex_effort;
+            || t.codex_effort != before.codex_effort
+            || t.target != before.target;
         if !changed {
             return;
         }
         if let Ok(mut s) = self.shared.lock() {
             *s = t.clone();
         }
+        // Claude's and Codex's sessions keep the target they were started with, so a new target starts new ones.
         let reload = match t.engine {
             Engine::Ollama => before.engine != Engine::Ollama || before.ollama_model != t.ollama_model,
-            Engine::Claude => before.engine != Engine::Claude || before.claude_model != t.claude_model,
+            Engine::Claude => {
+                before.engine != Engine::Claude || before.claude_model != t.claude_model || before.target != t.target
+            }
             Engine::Codex => {
-                before.engine != Engine::Codex || (&before.codex_model, &before.codex_effort) != (&t.codex_model, &t.codex_effort)
+                before.engine != Engine::Codex
+                    || (&before.codex_model, &before.codex_effort, &before.target) != (&t.codex_model, &t.codex_effort, &t.target)
             }
             Engine::Off => false,
         };
@@ -848,7 +864,7 @@ impl App {
                 Engine::Off => {
                     ui.colored_label(
                         APP_SHELL_WEAK_TEXT,
-                        tr(lang, "翻訳しない設定です。翻訳先は上の欄で選べます。", "Translation is off. Choose an engine above."),
+                        tr(lang, "翻訳しない設定です。翻訳のエンジンは上の欄で選べます。", "Translation is off. Choose an engine above."),
                     );
                 }
             });
@@ -1090,13 +1106,13 @@ impl App {
             let mut bottom = rect.bottom() - 12.0;
             for (i, line) in self.lines.iter().rev().enumerate() {
                 let dim = if i == 0 { 1.0 } else { 0.55 };
-                let (main, color) = match &line.japanese {
-                    Japanese::Done(ja) => (ja.as_str(), egui::Color32::WHITE),
-                    Japanese::Pending => ("…", APP_SHELL_WEAK_TEXT),
-                    Japanese::NotNeeded | Japanese::Failed(_) => (line.original.as_str(), egui::Color32::WHITE),
+                let (main, color) = match &line.translation {
+                    Translation::Done(t) => (t.as_str(), egui::Color32::WHITE),
+                    Translation::Pending => ("…", APP_SHELL_WEAK_TEXT),
+                    Translation::NotNeeded | Translation::Failed(_) => (line.original.as_str(), egui::Color32::WHITE),
                 };
                 let main = painter.layout_job(band_job(main, main_size, color.gamma_multiply(dim), 2, width));
-                let original = (show_original && matches!(line.japanese, Japanese::Done(_) | Japanese::Pending)).then(|| {
+                let original = (show_original && matches!(line.translation, Translation::Done(_) | Translation::Pending)).then(|| {
                     let text = format!("[{}] {}", line.lang, line.original);
                     painter.layout_job(band_job(&text, original_size, APP_SHELL_WEAK_TEXT.gamma_multiply(dim), 1, width))
                 });
@@ -1152,21 +1168,21 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             for line in &self.lines {
                 let big = |t: &str| egui::RichText::new(t).size(main_size).strong();
-                match &line.japanese {
-                    Japanese::Done(ja) => {
-                        ui.label(big(ja));
+                match &line.translation {
+                    Translation::Done(t) => {
+                        ui.label(big(t));
                     }
-                    Japanese::Pending => {
+                    Translation::Pending => {
                         ui.colored_label(APP_SHELL_WEAK_TEXT, tr(lang, "翻訳中…", "Translating…"));
                     }
-                    Japanese::Failed(e) => {
+                    Translation::Failed(e) => {
                         ui.colored_label(ERROR_RED, format!("{}: {e}", tr(lang, "翻訳失敗", "Translation failed")));
                     }
-                    Japanese::NotNeeded => {
+                    Translation::NotNeeded => {
                         ui.label(big(&line.original));
                     }
                 }
-                if self.persisted.show_original && !matches!(line.japanese, Japanese::NotNeeded) {
+                if self.persisted.show_original && !matches!(line.translation, Translation::NotNeeded) {
                     ui.colored_label(APP_SHELL_WEAK_TEXT, format!("[{}] {}", line.lang, line.original));
                 }
                 ui.add_space(original_size * 0.6);
@@ -1198,6 +1214,28 @@ fn tr(lang: AppShellLanguage, japanese: &'static str, english: &'static str) -> 
     match lang {
         AppShellLanguage::Japanese => japanese,
         AppShellLanguage::English => english,
+    }
+}
+
+/// macOS fonts for the scripts the UI font (Hiragino) lacks: the Chinese characters outside Japanese use, Hangul
+/// and Thai. Subtitles in these languages, as heard or as translated, would otherwise show as empty boxes. Each
+/// file's first face is its regular weight.
+const SCRIPT_FONTS: [(&str, &str); 3] = [
+    ("Hiragino Sans GB", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    ("Apple SD Gothic Neo", "/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+    ("Thonburi", "/System/Library/Fonts/Supplemental/Thonburi.ttc"),
+];
+
+/// Adds `SCRIPT_FONTS` after every other font, so they supply only the letters the others lack. A font this Mac
+/// does not have leaves its script as boxes, as before.
+fn install_script_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    for (name, path) in SCRIPT_FONTS {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let family = InsertFontFamily { family: egui::FontFamily::Proportional, priority: FontPriority::Lowest };
+        ctx.add_font(FontInsert::new(name, egui::FontData::from_owned(bytes), vec![family]));
     }
 }
 

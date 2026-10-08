@@ -6,7 +6,7 @@
 //! notifications by thread id). A slot's thread is replaced after `NEW_THREAD_AFTER` turns so its history does
 //! not grow without bound. Authentication is the signed-in ChatGPT account of the local Codex.
 
-use crate::translate::{lock_within, subtitle_message, SUBTITLE_PROMPT, QUEUE_LIMIT};
+use crate::translate::{lock_within, subtitle_message, subtitle_prompt, QUEUE_LIMIT};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -168,15 +168,17 @@ struct Pool {
     slots: Vec<Mutex<Slot>>,
     model: String,
     effort: String,
+    /// The code of the language the threads translate into; their base instructions name it.
+    target: String,
     next: AtomicUsize,
 }
 
-fn start_thread(server: &Server, model: &str) -> Result<Slot, String> {
+fn start_thread(server: &Server, model: &str, target: &str) -> Result<Slot, String> {
     let mut params = json!({
         "ephemeral": true,
         "approvalPolicy": "never",
         "sandbox": "read-only",
-        "baseInstructions": SUBTITLE_PROMPT,
+        "baseInstructions": subtitle_prompt(target),
         "cwd": std::env::temp_dir().to_string_lossy(),
     });
     if !model.is_empty() {
@@ -190,12 +192,13 @@ fn start_thread(server: &Server, model: &str) -> Result<Slot, String> {
 }
 
 impl Pool {
-    fn open(model: &str, effort: &str) -> Result<Self, String> {
+    fn open(model: &str, effort: &str, target: &str) -> Result<Self, String> {
         let server = Server::start()?;
         let slots = (0..SLOTS)
-            .map(|_| start_thread(&server, model).map(Mutex::new))
+            .map(|_| start_thread(&server, model, target).map(Mutex::new))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { server, slots, model: model.to_string(), effort: effort.to_string(), next: AtomicUsize::new(0) })
+        let (model, effort, target) = (model.to_string(), effort.to_string(), target.to_string());
+        Ok(Self { server, slots, model, effort, target, next: AtomicUsize::new(0) })
     }
 
     /// A free slot, waiting up to `QUEUE_LIMIT` for one.
@@ -220,7 +223,7 @@ impl Pool {
     fn ask(&self, slot: &mut Slot, context: &[String], lang: &str, text: &str) -> Result<String, String> {
         if slot.turns >= NEW_THREAD_AFTER {
             let old = slot.thread_id.clone();
-            *slot = start_thread(&self.server, &self.model)?;
+            *slot = start_thread(&self.server, &self.model, &self.target)?;
             self.server.routes.lock().map_err(|_| "codex の状態が壊れた".to_string())?.remove(&old);
         }
         slot.turns += 1;
@@ -274,12 +277,19 @@ impl Pool {
 static POOL: Mutex<Option<Arc<Pool>>> = Mutex::new(None);
 
 /// Translates one subtitle line; up to `SLOTS` lines are translated at the same time.
-pub fn translate(model: &str, effort: &str, context: &[String], lang: &str, text: &str) -> Result<String, String> {
+pub fn translate(
+    model: &str,
+    effort: &str,
+    target: &str,
+    context: &[String],
+    lang: &str,
+    text: &str,
+) -> Result<String, String> {
     let pool = {
         let mut current = lock_within(&POOL, QUEUE_LIMIT)?;
-        if current.as_ref().is_none_or(|p| p.model != model || p.effort != effort) {
+        if current.as_ref().is_none_or(|p| p.model != model || p.effort != effort || p.target != target) {
             *current = None;
-            *current = Some(Arc::new(Pool::open(model, effort)?));
+            *current = Some(Arc::new(Pool::open(model, effort, target)?));
         }
         current.clone().ok_or("codex のセッションが無い")?
     };

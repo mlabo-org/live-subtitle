@@ -64,6 +64,8 @@ pub struct TranslateSettings {
     pub codex_model: String,
     /// Reasoning effort for Codex; empty means the model's own default (chosen as "既定" in the window).
     pub codex_effort: String,
+    /// The code of the language to translate into, one of `TARGETS`.
+    pub target: String,
 }
 
 impl Default for TranslateSettings {
@@ -74,34 +76,94 @@ impl Default for TranslateSettings {
             claude_model: CLAUDE_MODELS[0].0.into(),
             codex_model: "gpt-5.6-luna".into(),
             codex_effort: "low".into(),
+            target: "ja".into(),
         }
     }
 }
 
-/// How the text to translate reads and how its Japanese should read, shared by every engine's prompt. The text is
-/// transcribed talk, so a word-for-word translation keeps its fillers and its English clause order.
-macro_rules! speech_style {
-    () => {
-        "The text is a speech-recognition transcript of spontaneous talk. Translate it into clear, natural Japanese \
-subtitles that read easily at a glance. Drop filler words (like, you know, kind of, I mean) and false starts, but keep \
-every point the speaker makes, and order the clauses the way natural Japanese would instead of following the source \
-word order. End each sentence with 。 or ？, never with an ellipsis (… or ...), 〜, or a dangling connective; if the \
-text breaks off, translate only what it says. The transcript may contain misheard words; where the context makes the \
-intended word clear, translate what was meant."
-    };
+/// A language subtitles can be translated into.
+pub struct Target {
+    /// The code whisper reports for speech in this language, so speech already in it is left untranslated.
+    pub code: &'static str,
+    /// The language's English name, as the prompts call it.
+    name: &'static str,
+    /// The window's labels in Japanese and in English; each carries the language's own name, so someone who
+    /// reads neither can still find theirs.
+    pub ja: &'static str,
+    pub en: &'static str,
+    /// How a sentence must end, when the general rule is not enough (a model left out 。 without being told).
+    sentence_end: Option<&'static str>,
 }
 
-/// System prompt of the long-lived Claude and Codex sessions, where each message is one subtitle line.
-pub const SUBTITLE_PROMPT: &str = concat!(
-    "You are a live subtitle translator. Every user message is one subtitle line written as \
-`[source-language-code] text`, sometimes after a `Context` list of preceding lines. Reply with only the Japanese \
-translation of the `[code] text` line: no notes, no quotation marks, no language tag; never translate the context lines. ",
-    speech_style!(),
-    " Keep proper nouns recognizable. If the text is already Japanese, repeat it unchanged. Earlier messages are \
-earlier subtitle lines; use them for context only."
-);
+/// The languages offered as the translation target. Scripts that egui cannot lay out (Arabic, Hebrew, the
+/// Indic scripts) are left out: their letters would show disconnected or out of order.
+pub const TARGETS: [Target; 13] = [
+    Target {
+        code: "ja",
+        name: "Japanese",
+        ja: "日本語",
+        en: "Japanese (日本語)",
+        sentence_end: Some("End each sentence with 。 or ？, never with an ellipsis (… or ...), 〜, or a dangling connective"),
+    },
+    Target { code: "en", name: "English", ja: "英語（English）", en: "English", sentence_end: None },
+    Target {
+        code: "zh",
+        name: "Simplified Chinese",
+        ja: "中国語・簡体字（简体中文）",
+        en: "Chinese, Simplified (简体中文)",
+        sentence_end: Some("End each sentence with 。 or ？, never with an ellipsis (… or ...) or a dangling connective"),
+    },
+    Target { code: "ko", name: "Korean", ja: "韓国語（한국어）", en: "Korean (한국어)", sentence_end: None },
+    Target { code: "th", name: "Thai", ja: "タイ語（ไทย）", en: "Thai (ไทย)", sentence_end: None },
+    Target { code: "vi", name: "Vietnamese", ja: "ベトナム語（Tiếng Việt）", en: "Vietnamese (Tiếng Việt)", sentence_end: None },
+    Target { code: "id", name: "Indonesian", ja: "インドネシア語（Bahasa Indonesia）", en: "Indonesian (Bahasa Indonesia)", sentence_end: None },
+    Target { code: "es", name: "Spanish", ja: "スペイン語（Español）", en: "Spanish (Español)", sentence_end: None },
+    Target { code: "fr", name: "French", ja: "フランス語（Français）", en: "French (Français)", sentence_end: None },
+    Target { code: "de", name: "German", ja: "ドイツ語（Deutsch）", en: "German (Deutsch)", sentence_end: None },
+    Target { code: "it", name: "Italian", ja: "イタリア語（Italiano）", en: "Italian (Italiano)", sentence_end: None },
+    Target { code: "pt", name: "Portuguese", ja: "ポルトガル語（Português）", en: "Portuguese (Português)", sentence_end: None },
+    Target { code: "ru", name: "Russian", ja: "ロシア語（Русский）", en: "Russian (Русский)", sentence_end: None },
+];
 
-/// One subtitle line as the long-lived Claude and Codex sessions are sent it (the form `SUBTITLE_PROMPT` describes).
+/// The target with this code. Settings store a code from `TARGETS` (settings saved before the choice existed get
+/// Japanese, the only target then); an unknown code is read as Japanese too.
+pub fn target(code: &str) -> &'static Target {
+    TARGETS.iter().find(|t| t.code == code).unwrap_or(&TARGETS[0])
+}
+
+/// How the text to translate reads and how its translation should read, shared by every engine's prompt. The
+/// text is transcribed talk, so a word-for-word translation keeps its fillers and the source's clause order.
+fn speech_style(target: &Target) -> String {
+    let name = target.name;
+    let sentence_end = target.sentence_end.map_or_else(
+        || format!("End each sentence the way written {name} does, never with an ellipsis (… or ...) or a dangling connective"),
+        str::to_string,
+    );
+    format!(
+        "The text is a speech-recognition transcript of spontaneous talk. Translate it into clear, natural {name} \
+subtitles that read easily at a glance. Drop filler words (like, you know, kind of, I mean) and false starts, but keep \
+every point the speaker makes, and order the clauses the way natural {name} would instead of following the source \
+word order. {sentence_end}; if the text breaks off, translate only what it says. The transcript may contain misheard \
+words; where the context makes the intended word clear, translate what was meant."
+    )
+}
+
+/// System prompt of the long-lived Claude and Codex sessions, where each message is one subtitle line. A
+/// session keeps the prompt it was started with, so a session for another target must not be reused.
+pub fn subtitle_prompt(target_code: &str) -> String {
+    let target = target(target_code);
+    let name = target.name;
+    format!(
+        "You are a live subtitle translator. Every user message is one subtitle line written as \
+`[source-language-code] text`, sometimes after a `Context` list of preceding lines. Reply with only the {name} \
+translation of the `[code] text` line: no notes, no quotation marks, no language tag; never translate the context lines. \
+{} Keep proper nouns recognizable. If the text is already {name}, repeat it unchanged. Earlier messages are \
+earlier subtitle lines; use them for context only.",
+        speech_style(target)
+    )
+}
+
+/// One subtitle line as the long-lived Claude and Codex sessions are sent it (the form `subtitle_prompt` describes).
 /// The preceding lines travel with it because several sessions share the work and none has seen every line.
 pub fn subtitle_message(context: &[String], lang: &str, text: &str) -> String {
     let mut message = String::new();
@@ -153,15 +215,15 @@ pub fn shutdown() {
     crate::codex::shutdown();
 }
 
-const SYSTEM_PROMPT: &str = concat!(
-    "You are a live subtitle translator. Translate the user's text into Japanese. ",
-    speech_style!(),
-    " Output only the Japanese translation, with no notes or quotation marks. \
-Keep proper nouns recognizable. If the text is already Japanese, output it unchanged."
-);
-
-fn system_prompt(lang: &str, context: &[String]) -> String {
-    let mut p = format!("{SYSTEM_PROMPT}\nSource language code: {lang}.");
+fn system_prompt(target_code: &str, lang: &str, context: &[String]) -> String {
+    let target = target(target_code);
+    let name = target.name;
+    let mut p = format!(
+        "You are a live subtitle translator. Translate the user's text into {name}. {} Output only the {name} \
+translation, with no notes or quotation marks. Keep proper nouns recognizable. If the text is already {name}, output it \
+unchanged.\nSource language code: {lang}.",
+        speech_style(target)
+    );
     if !context.is_empty() {
         p.push_str("\nPrevious lines, for context only (do not translate them):\n");
         for c in context {
@@ -179,11 +241,11 @@ pub fn translate(
     lang: &str,
     context: &[String],
 ) -> Result<String, String> {
-    let system = system_prompt(lang, context);
-    let out = match settings.engine {
-        Engine::Ollama => ollama(&settings.ollama_model, &system, text)?,
-        Engine::Claude => crate::claude::translate(&settings.claude_model, context, lang, text)?,
-        Engine::Codex => crate::codex::translate(&settings.codex_model, &settings.codex_effort, context, lang, text)?,
+    let t = settings;
+    let out = match t.engine {
+        Engine::Ollama => ollama(&t.ollama_model, &system_prompt(&t.target, lang, context), text)?,
+        Engine::Claude => crate::claude::translate(&t.claude_model, &t.target, context, lang, text)?,
+        Engine::Codex => crate::codex::translate(&t.codex_model, &t.codex_effort, &t.target, context, lang, text)?,
         Engine::Off => return Ok(text.to_string()),
     };
     let out = single_line(&out);
@@ -205,11 +267,11 @@ fn single_line(reply: &str) -> String {
 pub fn warm_up(settings: &TranslateSettings) {
     match settings.engine {
         Engine::Claude => {
-            let _ = crate::claude::warm_up(&settings.claude_model);
+            let _ = crate::claude::warm_up(&settings.claude_model, &settings.target);
         }
         Engine::Ollama => {
             let _loading = OLLAMA_LOADING.lock();
-            let _ = ollama_request(&settings.ollama_model, &system_prompt("en", &[]), "Hello.");
+            let _ = ollama_request(&settings.ollama_model, &system_prompt(&settings.target, "en", &[]), "Hello.");
         }
         Engine::Codex => {
             let _ = translate(settings, "Hello.", "en", &[]);
@@ -371,6 +433,28 @@ fn unload_all_at(host: &str) -> Result<usize, String> {
             return Err("モデルの解放が 30 秒で終わらなかった".into());
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompts_name_the_chosen_target_and_its_sentence_end() {
+        let japanese = subtitle_prompt("ja");
+        assert!(japanese.contains("natural Japanese subtitles") && japanese.contains("End each sentence with 。 or ？"));
+        for prompt in [subtitle_prompt("th"), system_prompt("th", "ja", &[])] {
+            assert!(prompt.contains("natural Thai subtitles") && prompt.contains("already Thai"), "{prompt}");
+            assert!(prompt.contains("the way written Thai does") && !prompt.contains("Japanese") && !prompt.contains('。'), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn every_target_code_is_one_whisper_reports() {
+        for t in &TARGETS {
+            assert!(whisper_rs::get_lang_id(t.code).is_some(), "{}", t.code);
+        }
     }
 }
 
