@@ -1,6 +1,8 @@
-// Turns a square picture into the macOS app icon set: the picture is clipped to an Apple-style rounded square
-// (a superellipse) inside a 1024 canvas with the usual margin, given a soft drop shadow, and scaled to every
-// size an .iconset needs.
+// Turns a square picture into the macOS app icon set and the running app's window icon.
+// The .iconset gets the picture full bleed and opaque: macOS applies its own rounded-square mask to bundle
+// icons, and draws an icon that already carries its own shape and margin small on a grey plate.
+// The window icon (which eframe hands to the Dock while the app runs, unmasked) is clipped to an Apple-style
+// rounded square (a superellipse) inside a 1024 canvas with the usual margin and a soft drop shadow.
 //   swift scripts/make-icon.swift <source.png> <iconset-dir>
 import CoreGraphics
 import Foundation
@@ -85,6 +87,6 @@ writePNG(runtimeContext.makeImage()!, to: outputDir.appendingPathComponent("wind
 for (name, size) in files {
     let context = bitmap(size)
     context.interpolationQuality = .high
-    context.draw(master, in: CGRect(x: 0, y: 0, width: size, height: size))
+    context.draw(picture, in: CGRect(x: 0, y: 0, width: size, height: size))
     writePNG(context.makeImage()!, to: outputDir.appendingPathComponent(name))
 }

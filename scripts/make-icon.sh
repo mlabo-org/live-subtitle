@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rebuilds assets/icon/AppIcon.icns (the app bundle's icon) and assets/icon/window-icon-512.png (the icon the running
+# Rebuilds assets/icon/AppIcon.icns (the app bundle's icon, full bleed for macOS to mask) and assets/icon/window-icon-512.png (the icon the running
 # app sets itself) from assets/icon/source.png (needs Swift and iconutil, both part of macOS/Xcode).
 set -euo pipefail
 cd "$(dirname "$0")/.."
