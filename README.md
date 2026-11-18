@@ -62,19 +62,17 @@ If Claude or Codex is not signed in, the "サインイン" (sign in) button in t
 
 ## Recommended translation model
 
-On the first launch the backend is the built-in engine (the QAT build of Gemma 4 26B). A backend chosen in an earlier version stays as it was set.
-
-**Ollama's `gemma4:26b-mlx`** feels comfortable in use (the author's impression). Measured values:
+**The built-in engine's Gemma 4 26B (the QAT build)** is the recommended choice, and it is the backend on the first launch (a backend chosen in an earlier version stays as it was set). It needs no other app. Measured values:
 
 | Item | Value |
 |---|---|
-| Translation per sentence | about 0.65–2 s (after the first; only the first load takes about 13 s) |
-| Disk | about 18 GB |
-| Memory (while loaded) | about 25.7 GB |
+| Translation per sentence | about 0.5–0.9 s (median 0.75 s over 40 sentences; only the first load takes about 7 s) |
+| Disk | about 14.4 GB |
+| Memory (while loaded) | about 14 GB |
 
-The built-in engine (the QAT build of Gemma 4 26B) translated the same 40 sentences with no clear difference in quality found, about 0.15 s per sentence faster (see "The built-in engine" below). If you do not have Ollama, the built-in engine is enough.
+If you use Ollama, `gemma4:26b-mlx` can be chosen too. Its median on the same 40 sentences was 0.88 s, with no clear difference in quality from the built-in engine found (how they were compared is under "The built-in engine" below). Its first load takes about 13 s, it takes about 18 GB on disk and about 25.7 GB in memory (as Ollama reports it).
 
-`gpt-oss:20b` (13 GB on disk, about 13.7 GB in memory) and `qwen3.8:27b-mlx` (18 GB on disk, about 20.0 GB in memory) were also confirmed to be selectable from the window's menu (their speed was not measured). Loading several models at once can exceed 50 GB.
+With Ollama, `gpt-oss:20b` (13 GB on disk, about 13.7 GB in memory) and `qwen3.8:27b-mlx` (18 GB on disk, about 20.0 GB in memory) were also confirmed to be selectable from the window's menu (their speed was not measured). Loading several models at once can exceed 50 GB.
 
 ## Verified environment
 
