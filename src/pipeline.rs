@@ -24,8 +24,10 @@ pub enum Stage {
 pub enum Event {
     /// Speech recognition model state.
     Asr(Stage),
-    /// Translation model state (Ollama warm-up).
+    /// Translation model state (the warm-up of the chosen engine).
     Translator(Stage),
+    /// The translation engine could not be made ready; speech is still recognized.
+    TranslatorFailed(String),
     /// RMS after automatic gain control, and the gain currently applied.
     Level { rms: f32, gain_db: f32 },
     Heard { id: u64, lang: String, text: String },
@@ -108,7 +110,7 @@ impl Pipeline {
 
         let _ = tx.send(Event::Asr(Stage::Loading));
         let engine = settings.lock().map(|s| s.engine).unwrap_or(Engine::Off);
-        if matches!(engine, Engine::Ollama | Engine::Claude | Engine::Codex) {
+        if matches!(engine, Engine::Ollama | Engine::Builtin | Engine::Claude | Engine::Codex) {
             warm_up(settings.clone(), tx.clone(), repaint.clone());
         } else {
             let _ = tx.send(Event::Translator(Stage::Idle));
@@ -135,7 +137,8 @@ impl Pipeline {
     }
 }
 
-/// Loads the translation model (Ollama) or starts the Claude session so the first subtitle is not delayed by a cold start.
+/// Loads the translation model (Ollama, the built-in engine) or starts the Claude or Codex session, so the first
+/// subtitle is not delayed by a cold start.
 pub fn warm_up(
     settings: SharedSettings,
     tx: Sender<Event>,
@@ -145,8 +148,17 @@ pub fn warm_up(
     repaint();
     std::thread::spawn(move || {
         let s = settings.lock().map(|s| s.clone()).unwrap_or_default();
-        translate::warm_up(&s);
-        let _ = tx.send(Event::Translator(Stage::Ready));
+        let outcome = translate::warm_up(&s);
+        // A warm-up overtaken by a change of engine or model says nothing: the new choice has its own warm-up,
+        // and stopping the old engine under this one is not a failure to show.
+        let current = settings.lock().map(|now| (now.engine, now.builtin_model.clone())).ok();
+        if outcome.is_err() && current != Some((s.engine, s.builtin_model.clone())) {
+            return;
+        }
+        let _ = tx.send(match outcome {
+            Ok(()) => Event::Translator(Stage::Ready),
+            Err(error) => Event::TranslatorFailed(error),
+        });
         repaint();
     });
 }

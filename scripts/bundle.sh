@@ -13,7 +13,11 @@ CARGO_TARGET_DIR="$WORK/target" cargo build --release
 APP="$WORK/Live Subtitle.app"
 mkdir -p "$APP/Contents/MacOS"
 cp "$WORK/target/release/live-subtitle" "$APP/Contents/MacOS/live-subtitle"
+# The built-in translation engine: llama.cpp's server beside the app's executable, with its licence.
+LLAMA_SERVER="$(scripts/llama-server.sh)"
+cp "$LLAMA_SERVER" "$APP/Contents/MacOS/llama-server"
 mkdir -p "$APP/Contents/Resources"
+cp "$(dirname "$LLAMA_SERVER")/LICENSE" "$APP/Contents/Resources/LLAMA_CPP_LICENSE"
 cp assets/icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,9 +34,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+# The server is signed before the app that contains it.
+codesign --force --sign "$IDENTITY" "$APP/Contents/MacOS/llama-server"
 codesign --force --sign "$IDENTITY" "$APP"
 mkdir -p "$OUT"
 rm -rf "$OUT/Live Subtitle.app"
 ditto --noextattr --noqtn "$APP" "$OUT/Live Subtitle.app"
+codesign --force --sign "$IDENTITY" "$OUT/Live Subtitle.app/Contents/MacOS/llama-server"
 codesign --force --sign "$IDENTITY" "$OUT/Live Subtitle.app"
 echo "$OUT/Live Subtitle.app"

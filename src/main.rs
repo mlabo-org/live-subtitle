@@ -2,6 +2,7 @@
 mod app_shell_foundation;
 mod agc;
 mod band;
+mod builtin;
 mod capture;
 mod claude;
 mod codex;
@@ -154,6 +155,12 @@ struct App {
     error: Option<String>,
     ollama_models: Vec<String>,
     ollama_models_rx: Option<Receiver<Vec<String>>>,
+    /// The download of the built-in engine's model, while one runs.
+    builtin_download: Option<builtin::Download>,
+    /// Models found on this Mac that the built-in engine can be pointed at, and the search that fills the list.
+    builtin_found: Vec<builtin::Found>,
+    builtin_found_rx: Option<Receiver<Vec<builtin::Found>>>,
+    builtin_found_tried: bool,
     /// Text being typed into the Claude model field; committed on Enter or when focus leaves.
     claude_model_edit: String,
     codex_models: Vec<codex::ModelInfo>,
@@ -209,6 +216,10 @@ impl App {
             error: None,
             ollama_models: Vec::new(),
             ollama_models_rx: None,
+            builtin_download: None,
+            builtin_found: Vec::new(),
+            builtin_found_rx: None,
+            builtin_found_tried: false,
             claude_model_edit: String::new(),
             codex_models: Vec::new(),
             codex_models_rx: None,
@@ -227,6 +238,7 @@ impl App {
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
         // A crash or a force-quit can leave models in memory; start from a clean slate.
+        builtin::reap_stale();
         app.release_ollama(&cc.egui_ctx, Release::Startup, false);
         app.fetch_ollama_models(&cc.egui_ctx);
         if autostart {
@@ -298,7 +310,7 @@ impl App {
         match engine {
             Engine::Claude => Some(&mut self.claude_auth),
             Engine::Codex => Some(&mut self.codex_auth),
-            Engine::Ollama | Engine::Off => None,
+            Engine::Ollama | Engine::Builtin | Engine::Off => None,
         }
     }
 
@@ -352,7 +364,7 @@ impl App {
         let state = match engine {
             Engine::Claude => self.claude_auth.clone(),
             Engine::Codex => self.codex_auth.clone(),
-            Engine::Ollama | Engine::Off => return,
+            Engine::Ollama | Engine::Builtin | Engine::Off => return,
         };
         let who = if engine == Engine::Claude { "Claude" } else { "ChatGPT" };
         let lang = self.lang;
@@ -422,6 +434,185 @@ impl App {
         }
     }
 
+    /// Looks for models on this Mac in the background: the search reads the folders of several tools.
+    fn find_builtin_models(&mut self, ctx: &egui::Context) {
+        self.builtin_found_tried = true;
+        if self.builtin_found_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.builtin_found_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(builtin::discover());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_builtin_models(&mut self) {
+        let Some(rx) = &self.builtin_found_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(found) => {
+                self.builtin_found = found;
+                self.builtin_found_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.builtin_found_rx = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Starts downloading the built-in engine's model in the background.
+    fn download_builtin_model(&mut self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        match builtin::download_recommended(move || ctx.request_repaint()) {
+            Ok(download) => {
+                self.error = None;
+                self.builtin_download = Some(download);
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Takes the result of a finished download: the model is loaded at once when subtitles are running.
+    fn poll_builtin_download(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.builtin_download.as_ref().and_then(builtin::Download::finished) else {
+            return;
+        };
+        self.builtin_download = None;
+        match result {
+            Ok(_) => {
+                self.error = None;
+                self.notice = Some(tr(self.lang, "内蔵エンジンのモデルをダウンロードした", "Downloaded the built-in engine's model").into());
+                if self.running() && self.persisted.translate.engine == Engine::Builtin {
+                    let ctx = ctx.clone();
+                    pipeline::warm_up(self.shared.clone(), self.tx.clone(), move || ctx.request_repaint());
+                }
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Which model the built-in engine uses and where it is; without one, the button that downloads it, and
+    /// while it downloads, how far it is.
+    fn builtin_model_row(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        const GB: f64 = 1e9;
+        let total = builtin::RECOMMENDED.size as f64;
+        if let Some(download) = &self.builtin_download {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                if download.verifying() {
+                    ui.label(tr(lang, "ダウンロードしたモデルを検証中…", "Verifying the downloaded model…"));
+                } else {
+                    let received = download.received() as f64;
+                    ui.label(format!(
+                        "{}: {:.1} / {:.1} GB（{:.0} %）",
+                        tr(lang, "モデルをダウンロード中", "Downloading the model"),
+                        received / GB,
+                        total / GB,
+                        received / total * 100.0
+                    ));
+                }
+                if ui.button(tr(lang, "中止", "Cancel")).clicked() {
+                    download.cancel();
+                }
+            });
+            return;
+        }
+        let chosen = self.persisted.translate.builtin_model.clone();
+        match builtin::model(chosen.as_deref()) {
+            Ok(path) => {
+                ui.colored_label(APP_SHELL_WEAK_TEXT, format!("{}: {}", tr(lang, "モデル", "Model"), history::display_dir(&path)));
+            }
+            Err(e) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(ERROR_RED, e);
+                    if chosen.is_none() {
+                        let label = match lang {
+                            AppShellLanguage::English => format!("Download ({:.1} GB)", total / GB),
+                            AppShellLanguage::Japanese => format!("ダウンロード（{:.1} GB）", total / GB),
+                        };
+                        if ui
+                            .button(label)
+                            .on_hover_text(tr(
+                                lang,
+                                "Hugging Face（google/gemma-4-26B-A4B-it-qat-q4_0-gguf）から取得する。途中で止めても、続きから再開できる",
+                                "Fetched from Hugging Face (google/gemma-4-26B-A4B-it-qat-q4_0-gguf). A stopped download continues where it left off",
+                            ))
+                            .clicked()
+                        {
+                            self.download_builtin_model(ui.ctx());
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// The built-in engine's part of the settings: its model, the other models found on this Mac, choosing a
+    /// GGUF file by hand, freeing its memory.
+    fn builtin_settings(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        self.builtin_model_row(ui);
+        ui.horizontal_wrapped(|ui| {
+            let t = &mut self.persisted.translate;
+            let recommended = format!("{}（{}）", builtin::RECOMMENDED.file, tr(lang, "推奨", "recommended"));
+            let entry = |found: &builtin::Found| format!("{}（{:.1} GB）", found.label, found.size as f64 / 1e9);
+            let selected = match &t.builtin_model {
+                None => recommended.clone(),
+                Some(path) => match self.builtin_found.iter().find(|found| &found.path == path) {
+                    Some(found) => entry(found),
+                    None => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                },
+            };
+            egui::ComboBox::from_id_salt("builtin-model")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut t.builtin_model, None, recommended);
+                    for found in &self.builtin_found {
+                        ui.selectable_value(&mut t.builtin_model, Some(found.path.clone()), entry(found));
+                    }
+                })
+                .response
+                .on_hover_text(tr(
+                    lang,
+                    "推奨モデルと、この Mac で見つかった GGUF（Ollama、LM Studio、Hugging Face のキャッシュなど）",
+                    "The recommended model and the GGUF files found on this Mac (Ollama, LM Studio, the Hugging Face cache and so on)",
+                ));
+            if ui.button(tr(lang, "探し直す", "Search again")).clicked() {
+                self.find_builtin_models(ui.ctx());
+            }
+            if ui
+                .button(tr(lang, "GGUF ファイルを選ぶ…", "Choose a GGUF file…"))
+                .on_hover_text(tr(
+                    lang,
+                    "一覧に出ない場所にある GGUF を、ファイルを指定して使う",
+                    "Use a GGUF file that is somewhere the list does not cover",
+                ))
+                .clicked()
+            {
+                let title = tr(lang, "内蔵エンジンのモデル", "Model for the built-in engine");
+                if let Some(file) = rfd::FileDialog::new().set_title(title).add_filter("GGUF", &["gguf"]).pick_file() {
+                    self.persisted.translate.builtin_model = Some(file);
+                }
+            }
+            if ui.button(tr(lang, "メモリ解放", "Free memory")).clicked() {
+                builtin::release();
+                self.notice = Some(tr(lang, "内蔵エンジンのモデルをメモリから解放した", "Freed the built-in engine's model from memory").into());
+            }
+        });
+        ui.colored_label(
+            APP_SHELL_WEAK_TEXT,
+            tr(
+                lang,
+                "内蔵エンジンは、アプリに入っている llama.cpp でモデルを動かす。推奨モデルは、このアプリ・Hugging Face・Ollama・LM Studio のどこかにあれば、それを使う。一覧のほかのモデルは、動くかどうかも訳の質も確かめていない（Ollama 独自の形式のものは、読み込めないことがある）。メモリ解放のあとは、次に訳すとき読み込み直す",
+                "The built-in engine runs the model with the llama.cpp inside the app. The recommended model is used from wherever this app, Hugging Face, Ollama or LM Studio keeps it. The other models in the list are untested, for loading and for quality (some in Ollama's own format do not load). After freeing memory, the model loads again for the next line",
+            ),
+        );
+    }
+
     fn fetch_codex_models(&mut self, ctx: &egui::Context) {
         if self.codex_models_rx.is_some() {
             return;
@@ -485,6 +676,10 @@ impl App {
             match ev {
                 Event::Asr(s) => self.asr = s,
                 Event::Translator(s) => self.translator = s,
+                Event::TranslatorFailed(e) => {
+                    self.translator = Stage::Idle;
+                    self.error = Some(e);
+                }
                 Event::Level { rms, gain_db } => {
                     frame_peak = frame_peak.max(rms);
                     self.gain_db = gain_db;
@@ -569,7 +764,12 @@ impl App {
         self.poll_ollama_models();
         self.poll_auth();
         self.poll_notices();
+        self.poll_builtin_download(ui.ctx());
+        self.poll_builtin_models();
         let engine = self.persisted.translate.engine;
+        if engine == Engine::Builtin && !self.builtin_found_tried {
+            self.find_builtin_models(ui.ctx());
+        }
         if engine == Engine::Codex && !self.codex_models_tried {
             self.fetch_codex_models(ui.ctx());
         }
@@ -646,11 +846,17 @@ impl App {
         let signed_in = match engine {
             Engine::Claude => self.claude_auth == Auth::SignedIn,
             Engine::Codex => self.codex_auth == Auth::SignedIn,
-            Engine::Ollama | Engine::Off => true,
+            Engine::Ollama | Engine::Builtin | Engine::Off => true,
         };
         // Open settings show the sign-in state in their translation section instead.
         if !signed_in && !self.settings_open {
             self.auth_row(ui, engine);
+        }
+        // The built-in engine needs the user only while it has no model: to start the download, or to follow it.
+        let builtin_needs_model = engine == Engine::Builtin
+            && (self.builtin_download.is_some() || builtin::model(self.persisted.translate.builtin_model.as_deref()).is_err());
+        if builtin_needs_model && !self.settings_open {
+            self.builtin_model_row(ui);
         }
         if let Some(e) = &self.error {
             ui.colored_label(ERROR_RED, e);
@@ -702,7 +908,7 @@ impl App {
             .response
             .on_hover_text(tr(lang, "訳す言語。この言語で話された音声は、訳さずにそのまま出す", "The language to translate into. Speech already in it is shown as heard"));
         egui::ComboBox::from_id_salt("engine").selected_text(t.engine.label(lang)).show_ui(ui, |ui| {
-            for e in [Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
+            for e in [Engine::Ollama, Engine::Builtin, Engine::Claude, Engine::Codex, Engine::Off] {
                 ui.selectable_value(&mut t.engine, e, e.label(lang));
             }
         });
@@ -717,6 +923,13 @@ impl App {
                         ui.selectable_value(&mut t.ollama_model, n.clone(), n);
                     }
                 });
+            }
+            Engine::Builtin => {
+                let name = match &t.builtin_model {
+                    Some(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    None => builtin::RECOMMENDED.file.to_string(),
+                };
+                ui.colored_label(APP_SHELL_WEAK_TEXT, name);
             }
             Engine::Claude => {
                 let label = translate::CLAUDE_MODELS
@@ -773,6 +986,7 @@ impl App {
         let t = &self.persisted.translate;
         let changed = t.engine != before.engine
             || t.ollama_model != before.ollama_model
+            || t.builtin_model != before.builtin_model
             || t.claude_model != before.claude_model
             || t.codex_model != before.codex_model
             || t.codex_effort != before.codex_effort
@@ -786,6 +1000,7 @@ impl App {
         // Claude's and Codex's sessions keep the target they were started with, so a new target starts new ones.
         let reload = match t.engine {
             Engine::Ollama => before.engine != Engine::Ollama || before.ollama_model != t.ollama_model,
+            Engine::Builtin => before.engine != Engine::Builtin || before.builtin_model != t.builtin_model,
             Engine::Claude => {
                 before.engine != Engine::Claude || before.claude_model != t.claude_model || before.target != t.target
             }
@@ -799,7 +1014,14 @@ impl App {
         // models are never resident together; the new model is loaded once the memory is free.
         let left_ollama_model =
             before.engine == Engine::Ollama && (t.engine != Engine::Ollama || t.ollama_model != before.ollama_model);
+        // The built-in engine's model is freed the same way when it is left; its server stops at once.
+        if before.engine == Engine::Builtin && (t.engine != Engine::Builtin || t.builtin_model != before.builtin_model) {
+            builtin::stop();
+        }
         let warm_up_now = self.running() && reload;
+        if warm_up_now {
+            self.error = None;
+        }
         if left_ollama_model {
             self.release_ollama(ctx, Release::ModelSwitch, warm_up_now);
         } else if warm_up_now {
@@ -831,6 +1053,7 @@ impl App {
                         ),
                     );
                 }
+                Engine::Builtin => self.builtin_settings(ui),
                 Engine::Claude => {
                     self.auth_row(ui, Engine::Claude);
                     if self.claude_model_edit.is_empty() {
@@ -1321,8 +1544,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        // Stop asking Ollama for anything, then free its memory before the process goes away.
+        // Stop asking Ollama for anything and stop the built-in engine's server, then free Ollama's memory before
+        // the process goes away.
         translate::close_ollama();
+        builtin::close();
         self.pipeline = None;
         pipeline::finish_asr();
         translate::shutdown();
@@ -1346,7 +1571,8 @@ impl eframe::App for App {
     }
 }
 
-/// Frees Ollama's memory when the app ends abnormally: on a panic, and on SIGTERM/SIGINT/SIGHUP.
+/// Frees Ollama's memory and stops the built-in engine's server when the app ends abnormally: on a panic, and
+/// on SIGTERM/SIGINT/SIGHUP.
 /// (A crash that gives no chance to run code is covered by the release at the next launch.)
 /// Appends a line to `~/Library/Application Support/LiveSubtitle/crash.log`, so an unexpected end of the app
 /// leaves a trace even when it was started from Finder and nobody saw its stderr.
@@ -1366,6 +1592,7 @@ fn install_safety_net() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log_crash_event(&format!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture()));
+        builtin::stop();
         let _ = translate::ollama_unload_all();
         previous(info);
     }));
@@ -1375,6 +1602,7 @@ fn install_safety_net() {
             if let Some(signal) = signals.forever().next() {
                 log_crash_event(&format!("received signal {signal}, shutting down"));
                 translate::close_ollama();
+                builtin::close();
                 pipeline::finish_asr();
                 translate::shutdown();
                 let _ = translate::ollama_unload_all();

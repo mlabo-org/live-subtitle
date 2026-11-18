@@ -1,7 +1,9 @@
-//! Translation backends: a local Ollama server, long-lived Claude CLI sessions, or a Codex App Server.
+//! Translation backends: the built-in llama.cpp server, a local Ollama server, long-lived Claude CLI sessions,
+//! or a Codex App Server.
 
 use crate::app_shell_foundation::AppShellLanguage;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::ChildStdout;
 use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +34,8 @@ pub fn explicit_claude_model(stored: &str) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Engine {
     Ollama,
+    /// The llama.cpp server shipped inside the app (`builtin.rs`).
+    Builtin,
     Claude,
     Codex,
     Off,
@@ -43,6 +47,8 @@ impl Engine {
         match self {
             Engine::Ollama if english => "Ollama (local, fast)",
             Engine::Ollama => "Ollama（ローカル・速い）",
+            Engine::Builtin if english => "Built-in (local, nothing else to install)",
+            Engine::Builtin => "内蔵（ローカル・追加アプリ不要）",
             Engine::Claude if english => "Claude (high quality)",
             Engine::Claude => "Claude（高品質）",
             Engine::Codex if english => "Codex (ChatGPT account)",
@@ -58,6 +64,8 @@ impl Engine {
 pub struct TranslateSettings {
     pub engine: Engine,
     pub ollama_model: String,
+    /// A GGUF file the user chose for the built-in engine; `None` means the recommended model.
+    pub builtin_model: Option<PathBuf>,
     pub claude_model: String,
     /// A model id from Codex's `model/list`. The default is a light model: translation takes seconds with any
     /// of them, and the heavier ones take longer.
@@ -73,6 +81,7 @@ impl Default for TranslateSettings {
         Self {
             engine: Engine::Ollama,
             ollama_model: "gemma4:26b-mlx".into(),
+            builtin_model: None,
             claude_model: CLAUDE_MODELS[0].0.into(),
             codex_model: "gpt-5.6-luna".into(),
             codex_effort: "low".into(),
@@ -209,13 +218,14 @@ pub fn lock_within<T>(mutex: &Mutex<T>, wait: Duration) -> Result<MutexGuard<'_,
     }
 }
 
-/// Stops the long-lived Claude and Codex processes.
+/// Stops the long-lived Claude and Codex processes and the built-in engine's server.
 pub fn shutdown() {
+    crate::builtin::stop();
     crate::claude::shutdown();
     crate::codex::shutdown();
 }
 
-fn system_prompt(target_code: &str, lang: &str, context: &[String]) -> String {
+pub(crate) fn system_prompt(target_code: &str, lang: &str, context: &[String]) -> String {
     let target = target(target_code);
     let name = target.name;
     let mut p = format!(
@@ -244,6 +254,9 @@ pub fn translate(
     let t = settings;
     let out = match t.engine {
         Engine::Ollama => ollama(&t.ollama_model, &system_prompt(&t.target, lang, context), text)?,
+        Engine::Builtin => {
+            crate::builtin::translate(t.builtin_model.as_deref(), &system_prompt(&t.target, lang, context), text)?
+        }
         Engine::Claude => crate::claude::translate(&t.claude_model, &t.target, context, lang, text)?,
         Engine::Codex => crate::codex::translate(&t.codex_model, &t.codex_effort, &t.target, context, lang, text)?,
         Engine::Off => return Ok(text.to_string()),
@@ -262,9 +275,11 @@ fn single_line(reply: &str) -> String {
     reply.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
-/// Gets the engine ready so the first subtitle is not slowed by a cold start: Ollama loads its model and Codex
-/// runs one turn; a new Claude session greets the model by itself, so it only has to be started.
-pub fn warm_up(settings: &TranslateSettings) {
+/// Gets the engine ready so the first subtitle is not slowed by a cold start: Ollama and the built-in engine
+/// load their model, Codex runs one turn, and a new Claude session greets the model by itself, so it only has
+/// to be started. The built-in engine reports why it cannot start (no model yet, no server binary); the others
+/// show their trouble on the first line they translate.
+pub fn warm_up(settings: &TranslateSettings) -> Result<(), String> {
     match settings.engine {
         Engine::Claude => {
             let _ = crate::claude::warm_up(&settings.claude_model, &settings.target);
@@ -273,11 +288,15 @@ pub fn warm_up(settings: &TranslateSettings) {
             let _loading = OLLAMA_LOADING.lock();
             let _ = ollama_request(&settings.ollama_model, &system_prompt(&settings.target, "en", &[]), "Hello.");
         }
+        Engine::Builtin => {
+            crate::builtin::warm_up(settings.builtin_model.as_deref(), &system_prompt(&settings.target, "en", &[]))?;
+        }
         Engine::Codex => {
             let _ = translate(settings, "Hello.", "en", &[]);
         }
         Engine::Off => {}
     }
+    Ok(())
 }
 
 fn ollama_host() -> String {
