@@ -34,7 +34,7 @@ pub fn explicit_claude_model(stored: &str) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Engine {
     Ollama,
-    /// The llama.cpp server shipped inside the app (`builtin.rs`).
+    /// The llama.cpp server shipped inside the app (`builtin.rs`). The default: it needs no other app.
     Builtin,
     Claude,
     Codex,
@@ -79,7 +79,7 @@ pub struct TranslateSettings {
 impl Default for TranslateSettings {
     fn default() -> Self {
         Self {
-            engine: Engine::Ollama,
+            engine: Engine::Builtin,
             ollama_model: "gemma4:26b-mlx".into(),
             builtin_model: None,
             claude_model: CLAUDE_MODELS[0].0.into(),

@@ -47,7 +47,7 @@ To keep the model elsewhere, set `LIVE_SUBTITLE_MODEL` to its path.
 
 **Translation backend (at least one; not needed if you use "翻訳しない" / no translation)**
 
-- **Built-in (free and offline; nothing else to install)**: translates with the llama.cpp inside the app. All it needs is one model (about 14.4 GB), which the window's "Download" button fetches. See "The built-in engine" below.
+- **Built-in (the default; free and offline; nothing else to install)**: translates with the llama.cpp inside the app. All it needs is one model (about 14.4 GB), which the window's "Download" button fetches. See "The built-in engine" below.
 - **Ollama (free and offline)**: install and start Ollama, then pull a model.
   ```bash
   ollama pull gemma4:26b-mlx
@@ -61,6 +61,8 @@ If Claude or Codex is not signed in, the "サインイン" (sign in) button in t
 **Signing identity (recommended)**: use a fixed code-signing identity so the Screen Recording permission survives rebuilds (see "Build and run" below).
 
 ## Recommended translation model
+
+On the first launch the backend is the built-in engine (the QAT build of Gemma 4 26B). A backend chosen in an earlier version stays as it was set.
 
 **Ollama's `gemma4:26b-mlx`** feels comfortable in use (the author's impression). Measured values:
 
@@ -134,8 +136,8 @@ If macOS asks for anything else (folder access and the like), just read the prom
 
 | Choice | Measured latency | Notes |
 |---|---|---|
-| Built-in (the QAT build of Gemma 4 26B) | about 0.5–0.9 s (median 0.75 s over 40 sentences; only the first load takes about 7 s, measured once, right after the file had been read; it is preloaded at start) | local, offline; no other app needed |
-| Ollama (default `gemma4:26b-mlx`) | about 0.7–2 s (only the first load takes about 13 s; it is preloaded at start) | local, offline |
+| Built-in (the default; the QAT build of Gemma 4 26B) | about 0.5–0.9 s (median 0.75 s over 40 sentences; only the first load takes about 7 s, measured once, right after the file had been read; it is preloaded at start) | local, offline; no other app needed |
+| Ollama (its default model is `gemma4:26b-mlx`) | about 0.7–2 s (only the first load takes about 13 s; it is preloaded at start) | local, offline |
 | Claude (a resident `claude -p`) | about 0.7–2 s depending on the model (only the first start takes about 1.3 s, measured with Haiku 5.5, during which "翻訳モデル読み込み中" is shown) | high quality; uses your plan's quota. Pick an explicit model version (Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.1) or type a model ID |
 | Codex (a resident `codex app-server`) | about 2–5 s (varies a lot; only the first start takes about 5 s) | uses the ChatGPT account the local Codex is signed in to. Models come from `model/list` (what your account can use), and the reasoning effort is selectable. The default on first use is GPT-5.6-Luna at low effort |
 | No translation | — | original text only |

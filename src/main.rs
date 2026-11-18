@@ -908,7 +908,7 @@ impl App {
             .response
             .on_hover_text(tr(lang, "訳す言語。この言語で話された音声は、訳さずにそのまま出す", "The language to translate into. Speech already in it is shown as heard"));
         egui::ComboBox::from_id_salt("engine").selected_text(t.engine.label(lang)).show_ui(ui, |ui| {
-            for e in [Engine::Ollama, Engine::Builtin, Engine::Claude, Engine::Codex, Engine::Off] {
+            for e in [Engine::Builtin, Engine::Ollama, Engine::Claude, Engine::Codex, Engine::Off] {
                 ui.selectable_value(&mut t.engine, e, e.label(lang));
             }
         });
