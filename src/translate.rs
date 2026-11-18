@@ -334,10 +334,15 @@ fn ollama(model: &str, system: &str, text: &str) -> Result<String, String> {
     ollama_request(model, system, text)
 }
 
+/// Whether this app has asked Ollama for a translation since Ollama's models were last unloaded: only then
+/// may a model of ours be in its memory, and only then is that memory freed when the app ends.
+static OLLAMA_USED: AtomicBool = AtomicBool::new(false);
+
 fn ollama_request(model: &str, system: &str, text: &str) -> Result<String, String> {
     if OLLAMA_CLOSED.load(Ordering::SeqCst) {
         return Err("終了処理中".into());
     }
+    OLLAMA_USED.store(true, Ordering::SeqCst);
     let body = serde_json::json!({
         "model": model,
         "stream": false,
@@ -401,7 +406,18 @@ fn loaded_models(agent: &ureq::Agent, host: &str) -> Result<Option<Vec<String>>,
 /// Each loaded model gets `keep_alive: 0` (Ollama's way to unload it), then `/api/ps` is polled until they
 /// are gone. A model somebody else loads in the meantime is reported instead of being chased.
 pub fn ollama_unload_all() -> Result<usize, String> {
+    OLLAMA_USED.store(false, Ordering::SeqCst);
     unload_all_at(&ollama_host())
+}
+
+/// Frees Ollama's memory when the app ends, if the app used Ollama. Someone who translates with another engine
+/// and keeps Ollama for other work must not find its models unloaded because this app was closed.
+pub fn ollama_unload_if_used() -> Result<usize, String> {
+    if OLLAMA_USED.load(Ordering::SeqCst) {
+        ollama_unload_all()
+    } else {
+        Ok(0)
+    }
 }
 
 /// An agent that hands back error statuses as responses, so the server's own reason can be shown.

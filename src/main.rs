@@ -237,9 +237,12 @@ impl App {
             notice: None,
             auto_band: std::env::var_os("LIVE_SUBTITLE_AUTOBAND").is_some(),
         };
-        // A crash or a force-quit can leave models in memory; start from a clean slate.
+        // A crash or a force-quit can leave models in memory; start from a clean slate. Ollama's memory is
+        // touched only when Ollama is the chosen engine: with any other, what it holds is not this app's.
         builtin::reap_stale();
-        app.release_ollama(&cc.egui_ctx, Release::Startup, false);
+        if app.persisted.translate.engine == Engine::Ollama {
+            app.release_ollama(&cc.egui_ctx, Release::Startup, false);
+        }
         app.fetch_ollama_models(&cc.egui_ctx);
         if autostart {
             app.start(&cc.egui_ctx);
@@ -1544,14 +1547,14 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        // Stop asking Ollama for anything and stop the built-in engine's server, then free Ollama's memory before
-        // the process goes away.
+        // Stop asking Ollama for anything and stop the built-in engine's server, then free Ollama's memory (if
+        // this app used Ollama) before the process goes away.
         translate::close_ollama();
         builtin::close();
         self.pipeline = None;
         pipeline::finish_asr();
         translate::shutdown();
-        let _ = translate::ollama_unload_all();
+        let _ = translate::ollama_unload_if_used();
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -1571,8 +1574,8 @@ impl eframe::App for App {
     }
 }
 
-/// Frees Ollama's memory and stops the built-in engine's server when the app ends abnormally: on a panic, and
-/// on SIGTERM/SIGINT/SIGHUP.
+/// Frees Ollama's memory (if this app used Ollama) and stops the built-in engine's server when the app ends
+/// abnormally: on a panic, and on SIGTERM/SIGINT/SIGHUP.
 /// (A crash that gives no chance to run code is covered by the release at the next launch.)
 /// Appends a line to `~/Library/Application Support/LiveSubtitle/crash.log`, so an unexpected end of the app
 /// leaves a trace even when it was started from Finder and nobody saw its stderr.
@@ -1593,7 +1596,7 @@ fn install_safety_net() {
     std::panic::set_hook(Box::new(move |info| {
         log_crash_event(&format!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture()));
         builtin::stop();
-        let _ = translate::ollama_unload_all();
+        let _ = translate::ollama_unload_if_used();
         previous(info);
     }));
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -1605,7 +1608,7 @@ fn install_safety_net() {
                 builtin::close();
                 pipeline::finish_asr();
                 translate::shutdown();
-                let _ = translate::ollama_unload_all();
+                let _ = translate::ollama_unload_if_used();
                 std::process::exit(0);
             }
         });

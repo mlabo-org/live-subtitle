@@ -123,7 +123,7 @@ If macOS asks for anything else (folder access and the like), just read the prom
 | Sound is playing but the meter stays at "無音" (silent) / no subtitles | Check the permission first. Also remember that the app's own sound is excluded from capture, and that a quiet source is lifted by the automatic gain control |
 | Subtitles lag | It depends on the backend and model: the built-in engine takes about 0.5–1 s, Ollama and Claude about 1–2 s, Codex about 2–5 s. With Codex pick a lighter model such as Luna or Terra. A line that waits more than 10 s for a translator is shown untranslated |
 | The first subtitle after starting is slow | The model is loading (built-in about 7 s, Ollama about 13 s, Claude about 1.3 s, Codex about 5 s). Wait while "…モデル読み込み中" is shown |
-| Your Mac uses 50 GB+ of memory | A large Ollama model is loaded. Press "メモリ解放" (Free memory) in Settings (it is also released automatically at start, at exit and on a model switch; what a forced kill left behind is cleared at the next launch) |
+| Your Mac uses 50 GB+ of memory | A large Ollama model is loaded. Press "メモリ解放" (Free memory) in Settings (with Ollama as the backend it is also released automatically at start, at exit and on a model switch; what a forced kill left behind is cleared at the next launch) |
 | Your Mac's sound suddenly got loud while testing | The app never changes the Mac's output volume or the signal sent to your speakers; the automatic gain control touches only the captured copy. The loudness seen during development came from full-level test sounds (`say`, `afplay`), not from the app's gain |
 | You lost the band | A hairline frame always marks its edges, and for the first 10 seconds that frame blinks yellow. Click the band to focus it, then press Esc or the restore button to return to the normal window. Esc works only while the band has focus |
 | Claude sign-in does not finish | If the browser flow does not complete by itself, run `claude auth login` in a terminal (the Claude sign-in action itself was not verified on the author's Mac) |
@@ -195,13 +195,13 @@ The app can translate locally by itself, without Ollama or anything else. The ll
 
 ## Releasing Ollama's memory
 
-A large model uses tens of GB of memory. The app frees it the same way [Taceta](https://github.com/mlabo-org/taceta) (a native macOS client for local inference) does with its "release all models" button (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them).
+A large model uses tens of GB of memory. The app frees it the same way [Taceta](https://github.com/mlabo-org/taceta) (a native macOS client for local inference) does with its "release all models" button (ask `/api/ps` which models are loaded, send each one `keep_alive: 0`, and wait until they are gone), at these times. **Models that other apps loaded are included** (they are simply reloaded the next time something uses them). When the backend is not Ollama, the app leaves Ollama's memory alone (unless you press "Free memory" yourself), so that someone who uses Ollama for other work does not have their models unloaded by this app.
 
 - When you press the "メモリ解放" (Free memory) button in Settings
-- When the app starts (to clear what an abnormal exit left behind)
-- When the app quits
+- When the app starts, only if the backend is Ollama (to clear what an abnormal exit left behind)
+- When the app quits, only if it asked Ollama for a translation during that run
 - When you switch the Ollama model, or switch the engine away from Ollama (the new model is loaded only after the memory is free)
-- When the app panics, or is terminated by SIGTERM / SIGINT / SIGHUP
+- When the app panics, or is terminated by SIGTERM / SIGINT / SIGHUP, under the same condition as on quitting
 
 If Ollama is not running, the app does not start it (nothing is considered loaded). If the app was killed without a chance to release, the models are cleared at the next launch; until then, Ollama frees them itself once the `keep_alive` (30 minutes) set on the translation requests runs out.
 
